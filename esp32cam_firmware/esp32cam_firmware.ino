@@ -1,8 +1,11 @@
 // esp32cam_firmware.ino
 // HackPack Turret Tracker — ESP32-CAM firmware
 //
-// Motion detection via frame differencing. Sends servo commands to the
-// Arduino Nano over UART (GPIO14 TX, GPIO15 RX).
+// Motion detection via frame differencing. Sends proportional X/Y tracking
+// errors to the Arduino Nano over UART (GPIO14 TX only — one-way link).
+// The Nano owns all servo state and translates errors into servo commands.
+//
+// Protocol: X<-100..100>Y<-100..100>\n   (0,0 = no target / stop)
 //
 // HTTP endpoints:
 //   http://<IP>:81/stream  — MJPEG live stream
@@ -44,25 +47,28 @@ const char* password = "YOUR_WIFI_PASSWORD";
 #define HREF_GPIO_NUM   23
 #define PCLK_GPIO_NUM   22
 
-// UART to Nano
-#define UART_TX_PIN  14   // ESP32-CAM GPIO14 → Nano D2 (RX)
-#define UART_RX_PIN  15   // ESP32-CAM GPIO15 ← Nano D3 (TX)
+// UART to Nano (TX only — one-way command link)
+#define UART_TX_PIN  14   // ESP32-CAM GPIO14 → Nano RX
 #define UART_BAUD    9600
 
+// ── Adaptive settling ─────────────────────────────────────────────────────────
+// After sending a move command the whole frame shifts. We discard frames until
+// the global pixel-diff drops back near the learned quiet baseline.
+#define SETTLE_LOW_THRESH   8      // pixel diff counted toward global motion score
+#define SETTLE_MULTIPLIER   2.5f   // "settled" when global diff < baseline * this
+#define SETTLE_MAX_FRAMES   10     // hard cap so we never stall indefinitely
+#define SETTLE_EMA_ALPHA    0.20f  // how fast the learned frame count adapts
+#define BASELINE_EMA_ALPHA  0.03f  // how fast the quiet baseline updates
+
 // =========================================================
-// Tunable tracking config (all adjustable at runtime via /config)
+// Tunable tracking config (adjustable at runtime via /config)
 // =========================================================
 struct Config {
-  int   threshold       = 25;    // pixel-diff threshold for motion detection
-  int   min_pixels      = 50;    // minimum motion pixels required to track
-  float pan_kp          = 0.08f; // proportional gain — pan axis
-  float tilt_kp         = 0.08f; // proportional gain — tilt axis
-  int   pan_center      = 90;    // rest angle — pan  (0-180°)
-  int   tilt_center     = 90;    // rest angle — tilt (0-180°)
-  int   smoothing_frames = 3;    // exponential smoothing window (future use)
-  bool  enabled         = true;  // master on/off
-  bool  hmirror         = false; // flip camera horizontally
-  bool  vflip           = false; // flip camera vertically
+  int  threshold  = 25;    // pixel-diff threshold for motion detection
+  int  min_pixels = 50;    // minimum motion pixels required to track
+  bool enabled    = true;  // master on/off
+  bool hmirror    = false; // flip camera horizontally
+  bool vflip      = false; // flip camera vertically
 };
 
 Config cfg;
@@ -70,10 +76,7 @@ Config cfg;
 // =========================================================
 // State
 // =========================================================
-volatile float current_pan  = 90.0f;
-volatile float current_tilt = 90.0f;
-
-uint8_t* prev_frame  = nullptr;
+uint8_t* prev_frame   = nullptr;
 int      frame_width  = 0;
 int      frame_height = 0;
 size_t   frame_bytes  = 0;
@@ -81,12 +84,18 @@ size_t   frame_bytes  = 0;
 // Stats (written by tracking task, read by HTTP handlers)
 volatile unsigned long stat_frames        = 0;
 volatile int           stat_motion_pixels = 0;
-volatile float         stat_cx = -1.0f;
+volatile float         stat_cx = -1.0f;   // motion centroid, pixels
 volatile float         stat_cy = -1.0f;
+volatile int           stat_ex =  0;      // last sent error X (-100..100)
+volatile int           stat_ey =  0;      // last sent error Y (-100..100)
 volatile unsigned long stat_last_cmd_ms   = 0;
 
-SemaphoreHandle_t camMutex;   // guards esp_camera_fb_get/return calls
-SemaphoreHandle_t statMutex;  // guards stat_* and current_pan/tilt writes
+// Settling state (written by tracking task, read by HTTP handler)
+volatile float stat_settle_ema      = 3.0f;  // learned settle frame count
+volatile float stat_baseline_diff   = -1.0f; // learned quiet global diff (-1 = init)
+
+SemaphoreHandle_t camMutex;
+SemaphoreHandle_t statMutex;
 
 WebServer server(80);
 WebServer streamServer(81);
@@ -118,7 +127,7 @@ bool initCamera() {
   config.pixel_format = PIXFORMAT_GRAYSCALE;
   config.frame_size   = FRAMESIZE_QVGA;  // 320 × 240
   config.jpeg_quality = 12;
-  config.fb_count     = 2;               // double-buffer for speed
+  config.fb_count     = 2;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -134,19 +143,22 @@ bool initCamera() {
 
 // =========================================================
 // Motion detection
-// Computes centroid of pixels that differ from the previous frame.
-// Returns true when enough motion is found.
+// Single pass: counts high-threshold pixels (target motion centroid) and
+// low-threshold pixels (global frame motion used by the settling detector).
 // =========================================================
 bool detectMotion(const uint8_t* curr, const uint8_t* prev,
                   int w, int h,
-                  float& cx, float& cy, int& motion_pixels) {
+                  float& cx, float& cy,
+                  int& motion_pixels, int& global_diff_pixels) {
   long sum_x = 0, sum_y = 0;
-  motion_pixels = 0;
+  motion_pixels      = 0;
+  global_diff_pixels = 0;
 
   for (int y = 0; y < h; y++) {
     for (int x = 0; x < w; x++) {
       int idx  = y * w + x;
       int diff = abs((int)curr[idx] - (int)prev[idx]);
+      if (diff > SETTLE_LOW_THRESH) global_diff_pixels++;
       if (diff > cfg.threshold) {
         sum_x += x;
         sum_y += y;
@@ -163,20 +175,19 @@ bool detectMotion(const uint8_t* curr, const uint8_t* prev,
 }
 
 // =========================================================
-// Send servo command to Nano
-// Format: P<pan>T<tilt>\n   e.g. "P90T90\n"
+// Send tracking error to Nano
+// ex, ey: -100..100 (% of half-frame; positive = right / down)
+// Sending 0,0 signals no target — Nano's watchdog stops the yaw.
 // =========================================================
-void sendServoCommand(float pan, float tilt) {
-  pan  = constrain(pan,  0.0f, 180.0f);
-  tilt = constrain(tilt, 0.0f, 180.0f);
-
+void sendTrackingError(int ex, int ey) {
   char cmd[24];
-  snprintf(cmd, sizeof(cmd), "P%dT%d\n", (int)pan, (int)tilt);
+  snprintf(cmd, sizeof(cmd), "X%dY%d\n", ex, ey);
   Serial2.print(cmd);
-
   Serial.printf("→ Nano: %s", cmd);
 
   xSemaphoreTake(statMutex, portMAX_DELAY);
+  stat_ex          = ex;
+  stat_ey          = ey;
   stat_last_cmd_ms = millis();
   xSemaphoreGive(statMutex);
 }
@@ -185,13 +196,19 @@ void sendServoCommand(float pan, float tilt) {
 // Tracking task — runs on core 0, frees core 1 for web servers
 // =========================================================
 void trackingTask(void* pvParameters) {
+  // Settling state — local to this task, no mutex needed
+  float settleEMA    = 3.0f;  // learned frame count (EMA)
+  float baselineDiff = -1.0f; // quiet-frame global diff EMA; -1 = not yet init
+  bool  settling     = false;
+  int   settleCounter = 0;
+
   for (;;) {
     if (!cfg.enabled) {
+      sendTrackingError(0, 0);
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
 
-    // Grab frame
     if (xSemaphoreTake(camMutex, pdMS_TO_TICKS(200)) != pdTRUE) continue;
     camera_fb_t* fb = esp_camera_fb_get();
     xSemaphoreGive(camMutex);
@@ -205,11 +222,11 @@ void trackingTask(void* pvParameters) {
     }
 
     float cx = 0.0f, cy = 0.0f;
-    int   motion_pixels = 0;
+    int   motion_pixels = 0, global_diff_pixels = 0;
 
     bool motion = detectMotion(fb->buf, prev_frame,
                                frame_width, frame_height,
-                               cx, cy, motion_pixels);
+                               cx, cy, motion_pixels, global_diff_pixels);
 
     memcpy(prev_frame, fb->buf, frame_bytes);
 
@@ -217,41 +234,66 @@ void trackingTask(void* pvParameters) {
     esp_camera_fb_return(fb);
     xSemaphoreGive(camMutex);
 
+    // Seed baseline from the very first frame
+    if (baselineDiff < 0.0f) baselineDiff = (float)global_diff_pixels;
+
+    float settleThreshold = baselineDiff * SETTLE_MULTIPLIER;
+
+    if (settling) {
+      settleCounter++;
+
+      bool frameSettled = (float)global_diff_pixels <= settleThreshold;
+      bool timedOut     = settleCounter >= SETTLE_MAX_FRAMES;
+
+      if (frameSettled || timedOut) {
+        // Update learned frame count with what we actually observed
+        settleEMA = settleEMA * (1.0f - SETTLE_EMA_ALPHA)
+                  + settleCounter  * SETTLE_EMA_ALPHA;
+        settling = false;
+        Serial.printf("Settled in %d frames (learned avg: %.1f)%s\n",
+                      settleCounter, settleEMA,
+                      timedOut && !frameSettled ? " [timeout]" : "");
+      }
+
+      // Discard this frame — send stop so the Nano watchdog doesn't spin
+      sendTrackingError(0, 0);
+
+    } else {
+      // Not settling: update the quiet baseline (slow EMA so occasional
+      // target motion doesn't skew it meaningfully)
+      baselineDiff = baselineDiff * (1.0f - BASELINE_EMA_ALPHA)
+                   + global_diff_pixels * BASELINE_EMA_ALPHA;
+
+      int ex = 0, ey = 0;
+      if (motion) {
+        float err_x = (cx - frame_width  * 0.5f) / (frame_width  * 0.5f);
+        float err_y = (cy - frame_height * 0.5f) / (frame_height * 0.5f);
+        ex = constrain((int)(err_x * 100.0f), -100, 100);
+        ey = constrain((int)(err_y * 100.0f), -100, 100);
+      }
+      sendTrackingError(ex, ey);
+
+      // Begin settling after any non-zero command
+      if (ex != 0 || ey != 0) {
+        settling      = true;
+        settleCounter = 0;
+      }
+    }
+
     xSemaphoreTake(statMutex, portMAX_DELAY);
     stat_frames++;
-    stat_motion_pixels = motion_pixels;
-    if (motion) {
-      stat_cx = cx;
-      stat_cy = cy;
-    }
+    stat_motion_pixels  = motion_pixels;
+    stat_settle_ema     = settleEMA;
+    stat_baseline_diff  = baselineDiff;
+    if (motion) { stat_cx = cx; stat_cy = cy; }
     xSemaphoreGive(statMutex);
 
-    if (motion) {
-      // Normalised error: -1 (left/up) to +1 (right/down)
-      float err_x = (cx - frame_width  * 0.5f) / (frame_width  * 0.5f);
-      float err_y = (cy - frame_height * 0.5f) / (frame_height * 0.5f);
-
-      xSemaphoreTake(statMutex, portMAX_DELAY);
-      // Pan: target right → error positive → rotate right (increase pan)
-      current_pan  += err_x * cfg.pan_kp  * 90.0f;
-      // Tilt: target low  → error positive → tilt down (decrease tilt)
-      current_tilt -= err_y * cfg.tilt_kp * 90.0f;
-      current_pan  = constrain(current_pan,  0.0f, 180.0f);
-      current_tilt = constrain(current_tilt, 0.0f, 180.0f);
-      float pan  = current_pan;
-      float tilt = current_tilt;
-      xSemaphoreGive(statMutex);
-
-      sendServoCommand(pan, tilt);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1));  // yield; tracking runs ~30 fps
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
 // =========================================================
 // HTTP: MJPEG stream  (port 81, /stream)
-// Streams grayscale frames converted to JPEG until client disconnects.
 // =========================================================
 void handleStream() {
   WiFiClient client = streamServer.client();
@@ -286,7 +328,7 @@ void handleStream() {
       free(jpg_buf);
     }
 
-    delay(50);  // ~20 fps stream cap
+    delay(50);
   }
 }
 
@@ -323,29 +365,34 @@ void handleStatus() {
   int           motion_pixels = stat_motion_pixels;
   float         cx            = stat_cx;
   float         cy            = stat_cy;
-  float         pan           = current_pan;
-  float         tilt          = current_tilt;
+  int           ex            = stat_ex;
+  int           ey            = stat_ey;
   unsigned long cmd_ms        = stat_last_cmd_ms;
+  float         settle_ema    = stat_settle_ema;
+  float         baseline_diff = stat_baseline_diff;
   xSemaphoreGive(statMutex);
 
-  char buf[512];
+  char buf[640];
   snprintf(buf, sizeof(buf),
     "{"
       "\"frames\":%lu,"
       "\"motion_pixels\":%d,"
       "\"target_x\":%.1f,"
       "\"target_y\":%.1f,"
-      "\"pan\":%.1f,"
-      "\"tilt\":%.1f,"
+      "\"error_x\":%d,"
+      "\"error_y\":%d,"
       "\"tracking\":%s,"
       "\"ms_since_cmd\":%lu,"
+      "\"settle_frames_learned\":%.1f,"
+      "\"baseline_diff\":%.0f,"
       "\"ip\":\"%s\","
       "\"rssi\":%d,"
       "\"heap\":%lu"
     "}",
-    frames, motion_pixels, cx, cy, pan, tilt,
+    frames, motion_pixels, cx, cy, ex, ey,
     cfg.enabled ? "true" : "false",
     millis() - cmd_ms,
+    settle_ema, baseline_diff,
     WiFi.localIP().toString().c_str(),
     WiFi.RSSI(),
     (unsigned long)ESP.getFreeHeap()
@@ -357,25 +404,10 @@ void handleStatus() {
 
 // HTTP: GET/SET config
 void handleConfig() {
-  if (server.hasArg("threshold"))        cfg.threshold        = server.arg("threshold").toInt();
-  if (server.hasArg("min_pixels"))       cfg.min_pixels       = server.arg("min_pixels").toInt();
-  if (server.hasArg("pan_kp"))           cfg.pan_kp           = server.arg("pan_kp").toFloat();
-  if (server.hasArg("tilt_kp"))          cfg.tilt_kp          = server.arg("tilt_kp").toFloat();
-  if (server.hasArg("smoothing_frames")) cfg.smoothing_frames = server.arg("smoothing_frames").toInt();
-  if (server.hasArg("enabled"))          cfg.enabled          = server.arg("enabled").toInt() != 0;
+  if (server.hasArg("threshold"))  cfg.threshold  = server.arg("threshold").toInt();
+  if (server.hasArg("min_pixels")) cfg.min_pixels = server.arg("min_pixels").toInt();
+  if (server.hasArg("enabled"))    cfg.enabled    = server.arg("enabled").toInt() != 0;
 
-  if (server.hasArg("pan_center")) {
-    cfg.pan_center = server.arg("pan_center").toInt();
-    xSemaphoreTake(statMutex, portMAX_DELAY);
-    current_pan = cfg.pan_center;
-    xSemaphoreGive(statMutex);
-  }
-  if (server.hasArg("tilt_center")) {
-    cfg.tilt_center = server.arg("tilt_center").toInt();
-    xSemaphoreTake(statMutex, portMAX_DELAY);
-    current_tilt = cfg.tilt_center;
-    xSemaphoreGive(statMutex);
-  }
   if (server.hasArg("hmirror")) {
     cfg.hmirror = server.arg("hmirror").toInt() != 0;
     sensor_t* s = esp_camera_sensor_get();
@@ -387,29 +419,16 @@ void handleConfig() {
     s->set_vflip(s, cfg.vflip ? 1 : 0);
   }
 
-  // Re-center if either angle just changed
-  if (server.hasArg("pan_center") || server.hasArg("tilt_center")) {
-    sendServoCommand(cfg.pan_center, cfg.tilt_center);
-  }
-
-  char buf[512];
+  char buf[256];
   snprintf(buf, sizeof(buf),
     "{"
       "\"threshold\":%d,"
       "\"min_pixels\":%d,"
-      "\"pan_kp\":%.4f,"
-      "\"tilt_kp\":%.4f,"
-      "\"pan_center\":%d,"
-      "\"tilt_center\":%d,"
-      "\"smoothing_frames\":%d,"
       "\"enabled\":%s,"
       "\"hmirror\":%s,"
       "\"vflip\":%s"
     "}",
     cfg.threshold, cfg.min_pixels,
-    cfg.pan_kp, cfg.tilt_kp,
-    cfg.pan_center, cfg.tilt_center,
-    cfg.smoothing_frames,
     cfg.enabled ? "true" : "false",
     cfg.hmirror  ? "true" : "false",
     cfg.vflip    ? "true" : "false"
@@ -426,11 +445,10 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n\n=== HackPack Turret Tracker — ESP32-CAM ===");
 
-  // UART2 → Nano (TX=14, RX=15)
-  Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  // UART2 → Nano (TX only; RX unused)
+  Serial2.begin(UART_BAUD, SERIAL_8N1, -1, UART_TX_PIN);
   Serial.println("UART2 to Nano ready");
 
-  // Camera
   if (!initCamera()) {
     Serial.println("FATAL: camera failed — rebooting in 5 s");
     delay(5000);
@@ -438,7 +456,6 @@ void setup() {
   }
   Serial.println("Camera OK");
 
-  // Capture one frame to learn dimensions and prime the previous-frame buffer
   camera_fb_t* fb = esp_camera_fb_get();
   if (fb) {
     frame_width  = fb->width;
@@ -454,11 +471,9 @@ void setup() {
     ESP.restart();
   }
 
-  // Mutexes
   camMutex  = xSemaphoreCreateMutex();
   statMutex = xSemaphoreCreateMutex();
 
-  // WiFi
   Serial.printf("Connecting to %s", ssid);
   WiFi.begin(ssid, password);
   for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
@@ -475,7 +490,6 @@ void setup() {
     Serial.println("\nWiFi FAILED — offline mode (tracking still works)");
   }
 
-  // OTA
   ArduinoOTA.setHostname("turret-cam");
   ArduinoOTA.onStart([]()            { Serial.println("OTA: start");    });
   ArduinoOTA.onEnd([]()              { Serial.println("OTA: end");      });
@@ -486,7 +500,6 @@ void setup() {
   ArduinoOTA.begin();
   Serial.println("OTA ready — hostname: turret-cam");
 
-  // HTTP routes
   server.on("/status",  handleStatus);
   server.on("/config",  handleConfig);
   server.on("/capture", handleCapture);
@@ -497,18 +510,14 @@ void setup() {
   streamServer.begin();
   Serial.println("Stream server started on port 81");
 
-  // Centre the turret
-  sendServoCommand(cfg.pan_center, cfg.tilt_center);
-
-  // Tracking task on core 0 (Arduino loop() runs on core 1)
   xTaskCreatePinnedToCore(
     trackingTask,
     "tracking",
-    8192,   // stack bytes
+    8192,
     nullptr,
-    1,      // priority
+    1,
     nullptr,
-    0       // core 0
+    0
   );
 
   Serial.println("Tracking task started — turret is live!\n");

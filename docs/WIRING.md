@@ -17,14 +17,16 @@ Connect these wires and leave them on the turret permanently.
 |---------------|--------------------|------------------------|---------|
 | **5V**        | **5V**             | Red                    | Power from breakout board           |
 | **GND**       | **GND**            | Black                  | Common ground                        |
-| **GPIO 14**   | **D2 (Nano)**      | Yellow                 | ESP32 TX → Nano RX (servo commands) |
-| **GPIO 15**   | **D3 (Nano)**      | Orange                 | ESP32 RX ← Nano TX (debug echo)     |
+| **GPIO 14**   | **Nano RX (D0)**   | Yellow                 | ESP32 TX → Nano RX (servo commands) |
 
 > **Power:** The ESP32-CAM is powered from the breakout board's **5 V** rail
 > (the same supply that powers the Nano).  The breakout board must be able to
 > source at least **600 mA** to cover the ESP32-CAM's peak draw (~500 mA) plus
 > the Nano and servos.  Verify your power supply before running both boards
 > simultaneously.
+>
+> **Data flow is one-way:** the ESP32-CAM sends commands to the Nano; the Nano
+> sends nothing back.  Only three wires are needed (5V, GND, GPIO 14).
 
 ### Diagram
 
@@ -33,8 +35,7 @@ Breakout board                  ESP32-CAM                       Arduino Nano
 ──────────────────────────────────────────────────────────────────────────────
 5V ─────────────────────────▶ 5V
 GND ────────────────────────── GND ────────────────────────────── GND
-                               GPIO 14 (TX) ──────────────────▶ D2 (RX via SoftwareSerial)
-                               GPIO 15 (RX) ◀────────────────── D3 (TX via SoftwareSerial)
+                               GPIO 14 (TX) ──────────────────▶ RX (D0)
 ```
 
 ---
@@ -97,7 +98,7 @@ to handle the combined peak load.  A 5000 mAh bank gives roughly 6–8 hours.
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| Nano receives garbage / nothing | TX/RX swapped | Double-check GPIO 14 → D2, not D3 |
+| Nano receives garbage / nothing | TX wire swapped | Confirm GPIO 14 → Nano RX (D0) |
 | ESP32-CAM won't enter flash mode | GPIO 0 not grounded | Re-seat jumper before plugging FTDI |
 | Servos twitch at startup | Both boards power up at different times | Add a 1-second `delay(1000)` at the start of Nano `setup()` |
 | Camera image is mirrored/flipped | Mount orientation | `curl "http://<IP>/config?hmirror=1"` or `?vflip=1` |
