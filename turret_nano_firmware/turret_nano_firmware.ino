@@ -15,9 +15,12 @@
 #define up      0x18
 #define down    0x52
 #define ok      0x1C
-#define cmd1    0x45
+#define cmd1    0x45   // mode-toggle sequence key (press 4× to switch modes)
 #define cmd2    0x46
 #define star    0x16
+
+// Press cmd1 this many times consecutively to toggle tracking / manual mode
+#define MODE_SEQ_LEN 4
 
 // ── Servos ───────────────────────────────────────────────────────────────────
 Servo yawServo;    // continuous rotation — base spin
@@ -51,6 +54,11 @@ int rollPrecision = 158;  // ms for ~60° (one dart)
 #define TRACK_TIMEOUT_MS 250
 unsigned long lastTrackMs = 0;
 
+// ── Mode ──────────────────────────────────────────────────────────────────────
+// false = manual (IR remote + single-char serial)
+// true  = tracking (X/Y serial commands from ESP32-CAM)
+bool trackingMode = false;
+
 // ── Forward declarations ──────────────────────────────────────────────────────
 void shakeHeadYes(int moves = 3);
 void shakeHeadNo(int moves = 3);
@@ -73,15 +81,36 @@ void setup() {
 void loop() {
     if (IrReceiver.decode()) {
         if (IrReceiver.decodedIRData.protocol != UNKNOWN) {
-            switch (IrReceiver.decodedIRData.command) {
-                case up:    upMove(1);        break;
-                case down:  downMove(1);      break;
-                case left:  leftMove(1);      break;
-                case right: rightMove(1);     break;
-                case ok:    fire();           break;
-                case star:  fireAll(); delay(50); break;
-                case cmd1:  shakeHeadYes(3);  break;
-                case cmd2:  shakeHeadNo(3);   break;
+            uint8_t irCmd = IrReceiver.decodedIRData.command;
+
+            // ── Mode toggle sequence ──────────────────────────────────────
+            // Pressing cmd1 four times consecutively switches modes.
+            // Any other button resets the counter.
+            static uint8_t seqCount = 0;
+            if (irCmd == cmd1) {
+                seqCount++;
+                if (seqCount >= MODE_SEQ_LEN) {
+                    seqCount      = 0;
+                    trackingMode  = !trackingMode;
+                    homeServos(); // physical acknowledgment of mode change
+                    Serial.println(trackingMode ? "MODE:TRACK" : "MODE:MANUAL");
+                }
+            } else {
+                seqCount = 0;
+
+                // ── Manual-mode IR commands ───────────────────────────────
+                // Ignored in tracking mode; camera has control.
+                if (!trackingMode) {
+                    switch (irCmd) {
+                        case up:    upMove(1);            break;
+                        case down:  downMove(1);          break;
+                        case left:  leftMove(1);          break;
+                        case right: rightMove(1);         break;
+                        case ok:    fire();               break;
+                        case star:  fireAll(); delay(50); break;
+                        case cmd2:  shakeHeadNo(3);       break;
+                    }
+                }
             }
         }
         IrReceiver.resume();
@@ -90,8 +119,8 @@ void loop() {
     delay(5);
     handleSerialCommands();
 
-    // Watchdog: stop yaw if ESP32 goes silent
-    if (millis() - lastTrackMs > TRACK_TIMEOUT_MS) {
+    // Watchdog: only needed in tracking mode — stop yaw if ESP32 goes silent
+    if (trackingMode && millis() - lastTrackMs > TRACK_TIMEOUT_MS) {
         yawServo.write(yawStopSpeed);
     }
 }
@@ -185,35 +214,51 @@ void shakeHeadNo(int moves) {
 }
 
 // ── Serial command parser ─────────────────────────────────────────────────────
-// Expects: X<signed_int>Y<signed_int>\n   e.g. "X-45Y23\n"
-// Gains are applied with integer division to avoid the float library.
+// Tracking mode : X<signed_int>Y<signed_int>\n  e.g. "X-45Y23\n"
+// Manual mode   : single letter + \n            e.g. "L\n"
+//                 L/R = yaw, U/D = pitch, F = fire, H = home, Y/N = gestures
 void handleSerialCommands() {
     static char    buf[32];
     static uint8_t pos = 0;
 
     while (Serial.available()) {
         char c = Serial.read();
-        if (c == '\n') {
+        if (c == '\n' || c == '\r') {
+            if (pos == 0) continue;
             buf[pos] = '\0';
             pos = 0;
-            if (buf[0] == 'X') {
-                int ex = atoi(buf + 1);
-                char* p = buf + 1;
-                while (*p && *p != 'Y') p++;
-                if (*p == 'Y') {
-                    int ey = atoi(p + 1);
-                    lastTrackMs = millis();
 
-                    // Yaw: proportional speed (continuous servo)
-                    // error_x > 0 = target right = clockwise = yawStopSpeed - offset
-                    int yawOffset = constrain(ex / YAW_DIV, -90, 90);
-                    yawServo.write(yawStopSpeed - yawOffset);
+            if (trackingMode) {
+                // ── Camera tracking commands ──────────────────────────────
+                if (buf[0] == 'X') {
+                    int ex = atoi(buf + 1);
+                    char* p = buf + 1;
+                    while (*p && *p != 'Y') p++;
+                    if (*p == 'Y') {
+                        int ey = atoi(p + 1);
+                        lastTrackMs = millis();
 
-                    // Pitch: proportional delta (positional servo)
-                    // error_y > 0 = target below centre = tilt down = decrease angle
-                    int pitchDelta = ey / PITCH_DIV;
-                    pitchServoVal = constrain(pitchServoVal - pitchDelta, pitchMin, pitchMax);
-                    pitchServo.write(pitchServoVal);
+                        // Yaw: error_x > 0 = target right = clockwise = stop - offset
+                        int yawOffset = constrain(ex / YAW_DIV, -90, 90);
+                        yawServo.write(yawStopSpeed - yawOffset);
+
+                        // Pitch: error_y > 0 = target below centre = decrease angle
+                        int pitchDelta = ey / PITCH_DIV;
+                        pitchServoVal = constrain(pitchServoVal - pitchDelta, pitchMin, pitchMax);
+                        pitchServo.write(pitchServoVal);
+                    }
+                }
+            } else {
+                // ── Manual serial commands ────────────────────────────────
+                switch (buf[0]) {
+                    case 'L': case 'l': leftMove(1);    break;
+                    case 'R': case 'r': rightMove(1);   break;
+                    case 'U': case 'u': upMove(1);      break;
+                    case 'D': case 'd': downMove(1);    break;
+                    case 'F': case 'f': fire();         break;
+                    case 'H': case 'h': homeServos();   break;
+                    case 'Y': case 'y': shakeHeadYes(); break;
+                    case 'N': case 'n': shakeHeadNo();  break;
                 }
             }
         } else if (pos < sizeof(buf) - 1) {
