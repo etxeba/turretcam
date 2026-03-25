@@ -15,12 +15,14 @@
 #define up      0x18
 #define down    0x52
 #define ok      0x1C
-#define cmd1    0x45   // mode-toggle sequence key (press 4× to switch modes)
+#define cmd1    0x45
 #define cmd2    0x46
+#define cmd5    0x40   // mode-toggle sequence key (press 4× to switch modes)
 #define star    0x16
 
-// Press cmd1 this many times consecutively to toggle tracking / manual mode
-#define MODE_SEQ_LEN 4
+// Press cmd5 this many times consecutively to toggle tracking / manual mode
+#define MODE_SEQ_CODE cmd5
+#define MODE_SEQ_LEN  4
 
 // ── Servos ───────────────────────────────────────────────────────────────────
 Servo yawServo;    // continuous rotation — base spin
@@ -87,7 +89,7 @@ void loop() {
             // Pressing cmd1 four times consecutively switches modes.
             // Any other button resets the counter.
             static uint8_t seqCount = 0;
-            if (irCmd == cmd1) {
+            if (irCmd == MODE_SEQ_CODE) {
                 seqCount++;
                 if (seqCount >= MODE_SEQ_LEN) {
                     seqCount      = 0;
@@ -108,6 +110,7 @@ void loop() {
                         case right: rightMove(1);         break;
                         case ok:    fire();               break;
                         case star:  fireAll(); delay(50); break;
+                        case cmd1:  shakeHeadYes(3);      break;
                         case cmd2:  shakeHeadNo(3);       break;
                     }
                 }
