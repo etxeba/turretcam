@@ -30,13 +30,12 @@ A self-contained motion-tracking upgrade for the [CrunchLabs Hack Pack](https://
 
 | Item | ~Price | Notes |
 |------|--------|-------|
-| CrunchLabs Hack Pack turret | (already have) | Includes Nano + servos |
-| ESP32-CAM (AI Thinker) | (already have) | With OV2640 camera |
+| [CrunchLabs Hack Pack turret](https://www.crunchlabs.com/pages/ir-turret-landing) | $66 | Includes Nano + servos |
+| [ESP32-CAM](https://www.amazon.com/Hosyond-ESP32-CAM-Bluetooth-Development-Compatible/dp/B09TB1GJ7P) | $14 | With OV2640 camera |
 | FTDI USB-to-TTL adapter (FT232RL) | ~$7 | One-time flash, then OTA |
 | Female-to-female jumper wires | ~$5 | For wiring |
 | ESP32-CAM case/mount | ~$6 | Optional, for clean mounting |
-| USB power bank (small) | ~$13 | For wireless operation |
-| **Total** | **~$31** | |
+| **Total** | **~$100** | |
 
 ## Wiring
 
