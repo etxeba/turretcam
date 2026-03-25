@@ -1,231 +1,316 @@
-# Hack Pack Turret Tracker
+# HackPack Turret Tracker
 
-A self-contained motion-tracking upgrade for the [CrunchLabs Hack Pack](https://www.crunchlabs.com/) turret by Mark Rober. Uses an ESP32-CAM for vision-based motion detection and sends servo commands to the Hack Pack Arduino Nano over UART.
+A self-contained motion-tracking upgrade for the [CrunchLabs Hack Pack](https://www.crunchlabs.com/) turret. An ESP32-CAM handles vision and sends proportional tracking errors to the Arduino Nano over a one-way UART link. The Nano owns all servo state and translates errors into movement.
 
-**No external computer required** — the turret tracks autonomously once powered on.
+**No external computer required** — the turret tracks and fires autonomously once powered on.
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│                  TURRET                      │
-│                                              │
-│  ┌──────────────┐     UART      ┌─────────┐ │
-│  │  ESP32-CAM   │──────────────▶│  Arduino │ │
-│  │              │  GPIO14→D2    │  Nano    │ │
-│  │  • Camera    │  GPIO15←D3    │          │ │
-│  │  • Motion    │  GND──GND     │  • Servo │ │
-│  │    detection │               │  control │ │
-│  │  • WiFi      │               └─────────┘ │
-│  │  • OTA       │                            │
-│  └──────────────┘                            │
-│                                              │
-│  ┌──────────────────────────────────────┐    │
-│  │        USB Power Bank                │    │
-│  └──────────────────────────────────────┘    │
-└─────────────────────────────────────────────┘
+Breakout board (USB-C power)
+        │ 5V + GND
+        ▼
+┌───────────────────────────────────────────────┐
+│                    TURRET                     │
+│                                               │
+│  ┌──────────────┐   GPIO14 TX   ┌──────────┐  │
+│  │  ESP32-CAM   │──────────────▶│  Arduino │  │
+│  │              │   (one-way)   │  Nano    │  │
+│  │  • Camera    │               │          │  │
+│  │  • Motion    │               │  • Yaw   │  │
+│  │    detection │               │  • Pitch │  │
+│  │  • WiFi      │               │  • Roll  │  │
+│  │  • OTA       │               │  • IR RX │  │
+│  └──────────────┘               └──────────┘  │
+└───────────────────────────────────────────────┘
 ```
+
+The ESP32-CAM sends `X<error>Y<error>\n` proportional error commands each frame. The Nano applies them to the yaw (continuous rotation) and pitch (positional) servos. The Nano also handles the IR remote and all three operating modes.
+
+---
 
 ## Bill of Materials
 
 | Item | ~Price | Notes |
 |------|--------|-------|
-| [CrunchLabs Hack Pack turret](https://www.crunchlabs.com/pages/ir-turret-landing) | $66 | Includes Nano + servos |
-| [ESP32-CAM](https://www.amazon.com/Hosyond-ESP32-CAM-Bluetooth-Development-Compatible/dp/B09TB1GJ7P) | $14 | With OV2640 camera |
-| FTDI USB-to-TTL adapter (FT232RL) | ~$7 | One-time flash, then OTA |
-| Female-to-female jumper wires | ~$5 | For wiring |
-| ESP32-CAM case/mount | ~$6 | Optional, for clean mounting |
-| **Total** | **~$100** | |
+| [CrunchLabs Hack Pack turret](https://www.crunchlabs.com/pages/ir-turret-landing) | $66 | Includes Nano, servos, IR remote |
+| [ESP32-CAM (AI Thinker)](https://www.amazon.com/s?k=esp32-cam+ai+thinker) | $10–14 | With OV2640 camera module |
+| FTDI USB-to-TTL adapter (FT232RL) | ~$7 | One-time initial flash only; OTA after that |
+| Female-to-female jumper wires | ~$5 | 3 wires needed permanently |
+| **Total** | **~$95** | |
+
+---
 
 ## Wiring
 
-### ESP32-CAM ↔ Arduino Nano (permanent, on turret)
+See `docs/WIRING.md` for the full reference with diagrams. Summary:
 
-| ESP32-CAM | Arduino Nano | Purpose |
-|-----------|-------------|---------|
-| GPIO 14 | D2 | ESP32 TX → Nano RX (commands) |
-| GPIO 15 | D3 | ESP32 RX ← Nano TX (debug) |
-| GND | GND | Common ground |
+### Permanent wiring (3 wires, stays on the turret)
 
-**Note:** Both boards get power from USB independently. The ESP32-CAM from a power bank, the Nano from the same or a shared source.
+| ESP32-CAM | Breakout board | Purpose |
+|-----------|---------------|---------|
+| **5V** | **5V** | Power from breakout board |
+| **GND** | **GND** | Common ground |
+| **GPIO 14** | **Nano RX (D0)** | Tracking error commands (TX only) |
 
-### FTDI ↔ ESP32-CAM (one-time flash only)
+> The ESP32-CAM is powered from the same breakout board that powers the Nano. Your USB-C supply must support at least **1 A** to cover both boards (~600 mA peak combined).
 
-| FTDI Adapter | ESP32-CAM | Notes |
-|-------------|-----------|-------|
-| 5V | 5V | Power |
+### FTDI wiring (one-time flash only)
+
+| FTDI | ESP32-CAM | Notes |
+|------|-----------|-------|
+| 5V | 5V | Power during flash |
 | GND | GND | Ground |
-| TX | U0R (RX) | Cross TX→RX |
-| RX | U0T (TX) | Cross RX→TX |
-| — | GPIO 0 → GND | **Bridge for flash mode** |
+| TX | U0R (RX0) | Cross TX→RX |
+| RX | U0T (TX0) | Cross RX→TX |
+| — | GPIO 0 → GND | Bridge to enter flash mode |
 
-## Setup Instructions
+---
 
-### Step 1: Install Arduino IDE + ESP32 Support
+## Setup
+
+### 1 — Install Arduino IDE and board support
 
 1. Download [Arduino IDE 2.x](https://www.arduino.cc/en/software)
-2. Open **File → Preferences**
-3. Add this to "Additional boards manager URLs":
+2. Open **File → Preferences** and add to "Additional boards manager URLs":
    ```
    https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
    ```
-4. Go to **Tools → Board → Boards Manager**, search "esp32", install **"esp32 by Espressif Systems"**
+3. **Tools → Board → Boards Manager** → search `esp32` → install **esp32 by Espressif Systems**
+4. Install libraries via **Tools → Manage Libraries**:
+   - `IRremote` by Armin Joachimsmeyer (Nano)
+   - `Servo` (Nano, usually pre-installed)
 
-### Step 2: Flash the ESP32-CAM (one-time)
+### 2 — Flash the Arduino Nano
 
-1. Update WiFi credentials in `esp32cam_firmware/esp32cam_firmware.ino`:
+1. Open `turret_nano_firmware/turret_nano_firmware.ino` in Arduino IDE
+2. Select board: **Tools → Board → Arduino AVR Boards → Arduino Nano**
+3. Select the Nano's USB-C serial port
+4. Click **Upload**
+
+No code changes needed — WiFi credentials and servo config live only on the ESP32.
+
+### 3 — Flash the ESP32-CAM (initial, wired)
+
+1. Open `esp32cam_firmware/esp32cam_firmware.ino`
+2. Set your WiFi credentials:
    ```cpp
    const char* ssid     = "YOUR_WIFI_SSID";
    const char* password = "YOUR_WIFI_PASSWORD";
    ```
+3. Wire the FTDI adapter to the ESP32-CAM (see wiring table above)
+4. **Bridge GPIO 0 to GND** on the ESP32-CAM
+5. Select board: **Tools → Board → esp32 → AI Thinker ESP32-CAM**
+6. Select the FTDI's serial port
+7. Click **Upload**; when the IDE shows `Connecting...` press the **RST** button once
+8. After upload: **remove the GPIO 0 bridge**, then press **RST** to boot normally
+9. Open Serial Monitor at **115200 baud** — you should see the IP address printed
 
-2. Wire FTDI adapter to ESP32-CAM (see wiring table above)
+All future firmware updates can be done wirelessly via OTA (see below).
 
-3. **Bridge GPIO 0 to GND** on the ESP32-CAM
+### 4 — Assemble and test
 
-4. Plug FTDI into your Mac via USB
+1. Connect the 3 permanent wires (5V, GND, GPIO 14)
+2. Power on via USB-C to the breakout board
+3. Open the live stream: `http://<ESP32_IP>:81/stream`
+4. Wave your hand in front of the camera — check that `error_x` / `error_y` respond at `http://<ESP32_IP>/status`
+5. Activate tracking mode on the Nano (see Modes below) and confirm the turret follows
 
-5. In Arduino IDE:
-   - Board: **Tools → Board → esp32 → AI Thinker ESP32-CAM**
-   - Port: Select the FTDI's serial port
-   - Partition Scheme: **Huge APP (3MB No OTA)** or **Default**
+---
 
-6. Click **Upload**
+## Modes
 
-7. When IDE says "Connecting...", press the **RST** button on ESP32-CAM
+The Nano has three operating modes, toggled with the IR remote. Both sequences share the `5-5-5` prefix — the 4th button decides which mode activates.
 
-8. After upload completes:
-   - **Remove** GPIO 0 to GND bridge
-   - Press RST to boot normally
+| Sequence | Transition | Effect |
+|----------|-----------|--------|
+| **5 → 5 → 5 → 5** | MANUAL → TRACKING | Camera controls the turret |
+| **5 → 5 → 5 → 5** | TRACKING → MANUAL | Returns to manual control |
+| **5 → 5 → 5 → 6** | any → AUTOFIRE | Camera tracks and fires automatically |
+| **5 → 5 → 5 → 5** | AUTOFIRE → MANUAL | Disengages auto-fire |
 
-9. Open **Serial Monitor** (115200 baud) — you should see the IP address and endpoints
+The turret homes its servos on every mode change as physical confirmation.
 
-### Step 3: Flash the Nano (via CrunchLabs)
+### MANUAL (default)
+- IR remote controls movement, fire, and gestures
+- Serial commands accepted over USB: `L`, `R`, `U`, `D`, `F`, `H`, `Y`, `N` (each followed by newline)
 
-1. Open the CrunchLabs IDE / programming tool
+### TRACKING
+- ESP32-CAM sends proportional X/Y error commands; Nano drives servos
+- IR remote and serial movement commands are ignored
+- Yaw stops automatically if the ESP32 goes silent for >250 ms (watchdog)
 
-2. Copy the code from `hackpack_nano/hackpack_nano.ino`
+### AUTOFIRE
+- Same as TRACKING, plus: fires continuously while the target is within the aim threshold
+- Stops firing immediately when the lock is lost
+- Dwell guard prevents firing as the turret sweeps through the aim point
 
-3. **Update servo pin numbers** to match your Hack Pack wiring:
-   ```cpp
-   #define PAN_SERVO_PIN   9   // change if different
-   #define TILT_SERVO_PIN  10  // change if different
-   ```
+#### Auto-fire tuning (in `turret_nano_firmware.ino`)
 
-4. Upload to the Nano via USB-C
+| Constant | Default | Effect |
+|----------|---------|--------|
+| `AUTOFIRE_AIM_THRESHOLD` | `15` | How tight the aim must be to fire (±% of half-frame; lower = harder to trigger) |
+| `AUTOFIRE_DWELL_FRAMES` | `3` | Consecutive on-target frames required before firing (~100 ms at 30 fps) |
 
-### Step 4: Wire & Test
+---
 
-1. Connect ESP32-CAM to Nano using the permanent wiring (3 wires)
-2. Power on both boards
-3. Open the stream in a browser: `http://<ESP32_IP>:81/stream`
-4. Wave your hand in front of the camera — the turret should follow!
-5. Check status: `http://<ESP32_IP>/status`
+## IR Remote Reference
 
-## Tuning the Tracker
+| Button | MANUAL mode | TRACKING / AUTOFIRE |
+|--------|------------|---------------------|
+| ▲ | Pitch up | — |
+| ▼ | Pitch down | — |
+| ◀ | Yaw left | — |
+| ▶ | Yaw right | — |
+| OK | Fire (single dart) | — |
+| ★ | Fire all darts | — |
+| 1 | Shake yes | — |
+| 2 | Shake no | — |
+| 5-5-5-5 | Enter TRACKING | Return to MANUAL |
+| 5-5-5-6 | Enter AUTOFIRE | Enter AUTOFIRE |
 
-The tracking behavior can be adjusted in real-time via the `/config` endpoint:
+---
+
+## Tracking gains (Nano)
+
+The Nano converts the ESP32's ±100 error values into servo commands using integer division — no floating-point library needed.
+
+| Constant | Default | Effect |
+|----------|---------|--------|
+| `YAW_DIV` | `2` | `error / YAW_DIV` = yaw speed offset (lower = faster yaw tracking) |
+| `PITCH_DIV` | `20` | `error / PITCH_DIV` = pitch step in degrees (lower = faster pitch tracking) |
+
+---
+
+## ESP32-CAM configuration
+
+All parameters are tunable at runtime via HTTP — no reflashing needed.
 
 ```bash
 # View current config
 curl http://<ESP32_IP>/config
 
-# Adjust motion sensitivity (lower = more sensitive)
+# Adjust motion sensitivity (lower threshold = more sensitive)
 curl "http://<ESP32_IP>/config?threshold=20"
 
-# Adjust tracking speed (higher = faster/twitchier)
-curl "http://<ESP32_IP>/config?pan_kp=0.1&tilt_kp=0.1"
-
-# Require more motion to trigger (reduces false positives)
+# Require more changed pixels before tracking (reduces false positives)
 curl "http://<ESP32_IP>/config?min_pixels=100"
 
-# Disable/enable tracking
+# Correct camera-to-barrel misalignment (pixels; tune until turret centres on target)
+curl "http://<ESP32_IP>/config?offset_x=-12&offset_y=5"
+
+# Flip image if camera is mounted upside-down or mirrored
+curl "http://<ESP32_IP>/config?hmirror=1&vflip=1"
+
+# Disable / enable tracking
 curl "http://<ESP32_IP>/config?enabled=0"
 curl "http://<ESP32_IP>/config?enabled=1"
 
-# Re-center the turret
-curl "http://<ESP32_IP>/config?pan_center=90&tilt_center=90"
+# Persist any setting across reboots (add save=1)
+curl "http://<ESP32_IP>/config?offset_x=-12&offset_y=5&save=1"
 ```
 
-### Tuning Tips
+### Config parameters
 
-| Problem | Fix |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `threshold` | `25` | Pixel-diff value that counts as motion |
+| `min_pixels` | `50` | Minimum changed pixels to confirm a target |
+| `enabled` | `1` | Master tracking on/off |
+| `hmirror` | `0` | Horizontal mirror |
+| `vflip` | `0` | Vertical flip |
+| `offset_x` | `0` | Camera-to-barrel X offset in pixels |
+| `offset_y` | `0` | Camera-to-barrel Y offset in pixels |
+| `save` | — | Pass `1` to persist current config to NVS |
+
+### Tuning tips
+
+| Symptom | Fix |
 |---------|-----|
-| Turret jitters / twitches | Increase `threshold` (try 40-50), increase `smoothing_frames` |
-| Turret doesn't react | Decrease `threshold` (try 15-20), decrease `min_pixels` |
-| Tracking is too slow | Increase `pan_kp` / `tilt_kp` (try 0.12-0.15) |
-| Tracking overshoots | Decrease `pan_kp` / `tilt_kp` (try 0.04-0.06) |
+| Turret jitters constantly | Increase `threshold` (try 35–50) or `min_pixels` |
+| Turret doesn't react | Decrease `threshold` (try 15–20) or `min_pixels` |
+| Tracking is sluggish | Lower `YAW_DIV` / `PITCH_DIV` in Nano firmware |
+| Tracking overshoots | Raise `YAW_DIV` / `PITCH_DIV` in Nano firmware |
+| Turret aims slightly off | Tune `offset_x` / `offset_y` via `/config` |
 | False triggers from lighting | Increase `threshold` and `min_pixels` |
-| Camera image is upside down | Set `hmirror` and `vflip` to 1 in firmware |
+| AUTOFIRE triggers too easily | Increase `AUTOFIRE_AIM_THRESHOLD` or `AUTOFIRE_DWELL_FRAMES` |
 
-## OTA Updates (after first flash)
+---
 
-Once the ESP32-CAM is running with OTA enabled, future code updates are wireless:
+## HTTP endpoints
 
-1. In Arduino IDE, go to **Tools → Port**
-2. You should see `turret-cam` listed as a network port
-3. Select it and upload — no wiring needed!
-
-If the network port doesn't appear:
-- Make sure your Mac is on the same WiFi network
-- Try restarting the Arduino IDE
-- Check that the ESP32-CAM is powered on and connected
-
-## Serial Protocol
-
-The ESP32-CAM sends commands to the Nano in this format:
-
-```
-P<pan_angle>T<tilt_angle>\n
-```
-
-Examples:
-- `P90T90\n` — center position
-- `P45T120\n` — pan left, tilt up
-- `P135T60\n` — pan right, tilt down
-
-Angles are 0-180, matching standard servo range.
-
-## Debugging
-
-### USB Serial (Nano)
-- Connect Nano via USB-C, open Serial Monitor at 115200 baud
-- Shows incoming commands and servo positions
-- Type `T` to toggle tracking mode on/off
-
-### USB Serial (ESP32-CAM, during development with FTDI)
-- Shows WiFi status, tracking stats, servo commands sent
-- Frame count, motion pixel count, target coordinates
-
-### HTTP Endpoints
 | Endpoint | Description |
 |----------|-------------|
 | `http://<IP>:81/stream` | Live MJPEG video stream |
 | `http://<IP>/capture` | Single JPEG snapshot |
-| `http://<IP>/status` | JSON with tracking stats, WiFi info, heap |
-| `http://<IP>/config` | GET/SET tracking parameters |
+| `http://<IP>/status` | JSON: tracking stats, errors, settling state, WiFi, heap |
+| `http://<IP>/config` | GET current config / SET parameters |
 
-## Project Structure
+### `/status` fields
+
+| Field | Description |
+|-------|-------------|
+| `frames` | Total frames processed |
+| `motion_pixels` | Changed pixels in last frame |
+| `target_x` / `target_y` | Motion centroid in pixels |
+| `error_x` / `error_y` | Last sent error (±100) |
+| `tracking` | Whether tracking is enabled |
+| `ms_since_cmd` | Milliseconds since last command sent to Nano |
+| `settle_frames_learned` | Adaptive settling: learned average discard count |
+| `baseline_diff` | Adaptive settling: learned quiet-frame pixel diff |
+| `ip` / `rssi` / `heap` | Network and memory info |
+
+---
+
+## Serial protocol (ESP32-CAM → Nano)
+
+The ESP32 sends one command per frame over UART at 9600 baud:
 
 ```
-hackpack-turret-tracker/
+X<error_x>Y<error_y>\n
+```
+
+- `error_x`, `error_y`: signed integers, range −100 to +100
+- Positive `error_x` = target is right of centre → yaw clockwise
+- Positive `error_y` = target is below centre → pitch down
+- `X0Y0\n` = no target detected; Nano watchdog stops yaw
+
+Examples:
+```
+X0Y0\n       no target
+X-45Y23\n    target left and below centre
+X100Y-12\n   target hard right, slightly above centre
+```
+
+---
+
+## OTA updates (after first flash)
+
+Once the ESP32-CAM is running, all future firmware updates are wireless:
+
+1. In Arduino IDE go to **Tools → Port** — you should see `turret-cam` as a network port
+2. Select it and click **Upload** — no wires needed
+
+If the network port doesn't appear: confirm your computer and the ESP32-CAM are on the same WiFi network, then restart Arduino IDE.
+
+---
+
+## Project structure
+
+```
+turretcam/
 ├── README.md
 ├── esp32cam_firmware/
-│   └── esp32cam_firmware.ino    # ESP32-CAM: camera + motion tracking + servo UART
-├── hackpack_nano/
-│   └── hackpack_nano.ino        # Arduino Nano: serial listener + servo driver
+│   └── esp32cam_firmware.ino   # Vision, motion detection, WiFi, OTA, HTTP
+├── turret_nano_firmware/
+│   └── turret_nano_firmware.ino # Servo control, IR remote, mode switching
 └── docs/
-    └── WIRING.md                # Detailed wiring reference
+    └── WIRING.md               # Detailed wiring reference with diagrams
 ```
 
-## Future Ideas
-
-- **Color tracking**: Track a specific color instead of general motion
-- **Face detection**: Use ESP32's built-in Haar cascade (slower, ~1-2 fps)
-- **Pi 5 upgrade**: Stream to Pi for YOLO-based detection + face recognition
-- **Multiple turrets**: Coordinate multiple turrets on the same network
-- **Nerf integration**: Auto-fire when target is centered
-- **Mobile app**: Control and monitor via phone
+---
 
 ## License
 
