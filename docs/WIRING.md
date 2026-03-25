@@ -1,0 +1,98 @@
+# Wiring Reference — HackPack Turret Tracker
+
+## Overview
+
+Three boards are involved:
+- **Arduino Nano** — already in the Hack Pack, drives the servos
+- **ESP32-CAM** (AI Thinker) — the new brain, does vision + sends commands
+- **FTDI adapter** (FT232RL) — one-time use only for the initial flash
+
+---
+
+## 1. Permanent Wiring: ESP32-CAM ↔ Arduino Nano
+
+Connect these three wires and leave them on the turret permanently.
+
+| ESP32-CAM pin | Arduino Nano pin | Wire color (suggestion) | Purpose |
+|---------------|-----------------|------------------------|---------|
+| **GPIO 14**   | **D2**          | Yellow                 | ESP32 TX → Nano RX (servo commands) |
+| **GPIO 15**   | **D3**          | Orange                 | ESP32 RX ← Nano TX (debug echo)     |
+| **GND**       | **GND**         | Black                  | Common ground                        |
+
+> **Power:** Both boards are powered independently via USB — the ESP32-CAM
+> from a USB power bank, the Nano from its existing USB-C connection (or the
+> same bank via a splitter).  Do **not** connect 5 V rails between boards.
+
+### Diagram
+
+```
+ESP32-CAM                       Arduino Nano
+─────────────────────────────────────────────
+GPIO 14 (TX) ──────────────────▶ D2 (RX via SoftwareSerial)
+GPIO 15 (RX) ◀────────────────── D3 (TX via SoftwareSerial)
+GND          ──────────────────── GND
+```
+
+---
+
+## 2. One-Time Flash Wiring: FTDI Adapter ↔ ESP32-CAM
+
+Use this only when uploading firmware for the first time.
+After that, use OTA updates over WiFi.
+
+| FTDI adapter pin | ESP32-CAM pin | Notes |
+|-----------------|--------------|-------|
+| **5 V**         | **5 V**      | Power the ESP32-CAM from the FTDI |
+| **GND**         | **GND**      | Ground |
+| **TX**          | **U0R (RX0)**| Cross TX→RX |
+| **RX**          | **U0T (TX0)**| Cross RX→TX |
+| *(jumper wire)* | **GPIO 0 → GND** | **Short this to enter flash mode** |
+
+### Flash Procedure
+
+1. Wire FTDI to ESP32-CAM as above.
+2. **Bridge GPIO 0 to GND** with a jumper wire.
+3. Plug FTDI into your computer via USB.
+4. In Arduino IDE: select board **AI Thinker ESP32-CAM**, select the FTDI's
+   serial port, click **Upload**.
+5. When the IDE shows `Connecting...`, press the **RST** button on the
+   ESP32-CAM once.
+6. Wait for `Done uploading`.
+7. **Remove** the GPIO 0 → GND bridge.
+8. Press **RST** again to boot normally.
+9. Open Serial Monitor at **115200 baud** — you should see the IP address.
+
+---
+
+## 3. Camera Mounting
+
+Mount the ESP32-CAM at the front of the turret so it looks in the same
+direction as the barrel.  Adjust `hmirror` / `vflip` at runtime if the image
+is backwards or upside-down:
+
+```bash
+curl "http://<ESP32_IP>/config?hmirror=1&vflip=1"
+```
+
+---
+
+## 4. Power Notes
+
+| Board        | Power source                  | Current draw (typical) |
+|--------------|-------------------------------|------------------------|
+| ESP32-CAM    | USB power bank (5 V / USB-A)  | ~250 mA idle, ~500 mA peak |
+| Arduino Nano | USB-C (existing Hack Pack)    | ~50 mA + servo load    |
+
+A 5000 mAh power bank gives roughly 6–8 hours of operation for the ESP32-CAM.
+
+---
+
+## 5. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| Nano receives garbage / nothing | TX/RX swapped | Double-check GPIO 14 → D2, not D3 |
+| ESP32-CAM won't enter flash mode | GPIO 0 not grounded | Re-seat jumper before plugging FTDI |
+| Servos twitch at startup | Both boards power up at different times | Add a 1-second `delay(1000)` at the start of Nano `setup()` |
+| Camera image is mirrored/flipped | Mount orientation | `curl "http://<IP>/config?hmirror=1"` or `?vflip=1` |
+| OTA port not visible in IDE | Different WiFi network | Make sure Mac and ESP32-CAM are on same SSID |
