@@ -69,6 +69,14 @@ struct Config {
   bool enabled    = true;  // master on/off
   bool hmirror    = false; // flip camera horizontally
   bool vflip      = false; // flip camera vertically
+  // Camera-to-barrel alignment offset in pixels.
+  // Shifts the "aim point" away from frame centre to compensate for a
+  // camera that isn't perfectly aligned with the barrel.
+  // Positive offset_x → aim point moves right; positive offset_y → moves down.
+  // Calibrate by pointing at a stationary target and tweaking via /config
+  // until the turret centres on it without hunting.
+  int  offset_x   = 0;
+  int  offset_y   = 0;
 };
 
 Config cfg;
@@ -266,8 +274,8 @@ void trackingTask(void* pvParameters) {
 
       int ex = 0, ey = 0;
       if (motion) {
-        float err_x = (cx - frame_width  * 0.5f) / (frame_width  * 0.5f);
-        float err_y = (cy - frame_height * 0.5f) / (frame_height * 0.5f);
+        float err_x = (cx - (frame_width  * 0.5f + cfg.offset_x)) / (frame_width  * 0.5f);
+        float err_y = (cy - (frame_height * 0.5f + cfg.offset_y)) / (frame_height * 0.5f);
         ex = constrain((int)(err_x * 100.0f), -100, 100);
         ey = constrain((int)(err_y * 100.0f), -100, 100);
       }
@@ -407,6 +415,8 @@ void handleConfig() {
   if (server.hasArg("threshold"))  cfg.threshold  = server.arg("threshold").toInt();
   if (server.hasArg("min_pixels")) cfg.min_pixels = server.arg("min_pixels").toInt();
   if (server.hasArg("enabled"))    cfg.enabled    = server.arg("enabled").toInt() != 0;
+  if (server.hasArg("offset_x"))   cfg.offset_x   = server.arg("offset_x").toInt();
+  if (server.hasArg("offset_y"))   cfg.offset_y   = server.arg("offset_y").toInt();
 
   if (server.hasArg("hmirror")) {
     cfg.hmirror = server.arg("hmirror").toInt() != 0;
@@ -426,12 +436,15 @@ void handleConfig() {
       "\"min_pixels\":%d,"
       "\"enabled\":%s,"
       "\"hmirror\":%s,"
-      "\"vflip\":%s"
+      "\"vflip\":%s,"
+      "\"offset_x\":%d,"
+      "\"offset_y\":%d"
     "}",
     cfg.threshold, cfg.min_pixels,
     cfg.enabled ? "true" : "false",
     cfg.hmirror  ? "true" : "false",
-    cfg.vflip    ? "true" : "false"
+    cfg.vflip    ? "true" : "false",
+    cfg.offset_x, cfg.offset_y
   );
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
