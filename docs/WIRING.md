@@ -11,26 +11,30 @@ Three boards are involved:
 
 ## 1. Permanent Wiring: ESP32-CAM ↔ Arduino Nano
 
-Connect these three wires and leave them on the turret permanently.
+Connect these wires and leave them on the turret permanently.
 
-| ESP32-CAM pin | Arduino Nano pin | Wire color (suggestion) | Purpose |
-|---------------|-----------------|------------------------|---------|
-| **GPIO 14**   | **D2**          | Yellow                 | ESP32 TX → Nano RX (servo commands) |
-| **GPIO 15**   | **D3**          | Orange                 | ESP32 RX ← Nano TX (debug echo)     |
-| **GND**       | **GND**         | Black                  | Common ground                        |
+| ESP32-CAM pin | Breakout board pin | Wire color (suggestion) | Purpose |
+|---------------|--------------------|------------------------|---------|
+| **5V**        | **5V**             | Red                    | Power from breakout board           |
+| **GND**       | **GND**            | Black                  | Common ground                        |
+| **GPIO 14**   | **D2 (Nano)**      | Yellow                 | ESP32 TX → Nano RX (servo commands) |
+| **GPIO 15**   | **D3 (Nano)**      | Orange                 | ESP32 RX ← Nano TX (debug echo)     |
 
-> **Power:** Both boards are powered independently via USB — the ESP32-CAM
-> from a USB power bank, the Nano from its existing USB-C connection (or the
-> same bank via a splitter).  Do **not** connect 5 V rails between boards.
+> **Power:** The ESP32-CAM is powered from the breakout board's **5 V** rail
+> (the same supply that powers the Nano).  The breakout board must be able to
+> source at least **600 mA** to cover the ESP32-CAM's peak draw (~500 mA) plus
+> the Nano and servos.  Verify your power supply before running both boards
+> simultaneously.
 
 ### Diagram
 
 ```
-ESP32-CAM                       Arduino Nano
-─────────────────────────────────────────────
-GPIO 14 (TX) ──────────────────▶ D2 (RX via SoftwareSerial)
-GPIO 15 (RX) ◀────────────────── D3 (TX via SoftwareSerial)
-GND          ──────────────────── GND
+Breakout board                  ESP32-CAM                       Arduino Nano
+──────────────────────────────────────────────────────────────────────────────
+5V ─────────────────────────▶ 5V
+GND ────────────────────────── GND ────────────────────────────── GND
+                               GPIO 14 (TX) ──────────────────▶ D2 (RX via SoftwareSerial)
+                               GPIO 15 (RX) ◀────────────────── D3 (TX via SoftwareSerial)
 ```
 
 ---
@@ -78,12 +82,14 @@ curl "http://<ESP32_IP>/config?hmirror=1&vflip=1"
 
 ## 4. Power Notes
 
-| Board        | Power source                  | Current draw (typical) |
-|--------------|-------------------------------|------------------------|
-| ESP32-CAM    | USB power bank (5 V / USB-A)  | ~250 mA idle, ~500 mA peak |
-| Arduino Nano | USB-C (existing Hack Pack)    | ~50 mA + servo load    |
+| Board        | Power source                        | Current draw (typical)     |
+|--------------|-------------------------------------|----------------------------|
+| ESP32-CAM    | Breakout board 5 V rail             | ~250 mA idle, ~500 mA peak |
+| Arduino Nano | Breakout board (via USB-C)          | ~50 mA + servo load        |
+| **Combined** | **Single USB-C supply to breakout** | **~600 mA peak**           |
 
-A 5000 mAh power bank gives roughly 6–8 hours of operation for the ESP32-CAM.
+Make sure your USB-C power supply (or power bank) is rated for at least **1 A**
+to handle the combined peak load.  A 5000 mAh bank gives roughly 6–8 hours.
 
 ---
 
