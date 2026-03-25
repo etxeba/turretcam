@@ -17,12 +17,14 @@
 #define ok      0x1C
 #define cmd1    0x45
 #define cmd2    0x46
-#define cmd5    0x40   // mode-toggle sequence key (press 4× to switch modes)
+#define cmd5    0x40
+#define cmd6    0x43
 #define star    0x16
 
-// Press cmd5 this many times consecutively to toggle tracking / manual mode
-#define MODE_SEQ_CODE cmd5
-#define MODE_SEQ_LEN  4
+// ── Mode sequences ────────────────────────────────────────────────────────────
+// 5-5-5-5 : MANUAL → TRACKING  (or any active mode → MANUAL)
+// 5-5-5-6 : any mode → AUTOFIRE
+// Both share the 5-5-5 prefix; the 4th button decides which sequence fires.
 
 // ── Servos ───────────────────────────────────────────────────────────────────
 Servo yawServo;    // continuous rotation — base spin
@@ -47,19 +49,26 @@ int rollMoveSpeed = 90;
 int rollPrecision = 158;  // ms for ~60° (one dart)
 
 // ── Tracking gains (integer arithmetic, no float library) ────────────────────
-// yaw:   offset = error / YAW_DIV   (error range -100..100 → offset -50..50)
-// pitch: delta  = error / PITCH_DIV (error 100 → 5° delta)
-#define YAW_DIV   2
-#define PITCH_DIV 20
+#define YAW_DIV   2    // error / YAW_DIV   = yaw speed offset  (±50 max)
+#define PITCH_DIV 20   // error / PITCH_DIV = pitch delta deg    (±5 max)
 
 // Stop yaw if no tracking command received within this window (ms)
 #define TRACK_TIMEOUT_MS 250
 unsigned long lastTrackMs = 0;
 
+// ── Auto-fire parameters ──────────────────────────────────────────────────────
+// Target is considered "aimed" when both X and Y errors are within this value
+// (out of ±100). 15 ≈ within 15% of half-frame width/height.
+#define AUTOFIRE_AIM_THRESHOLD 15
+// Must stay on-target for this many consecutive frames before firing,
+// to avoid triggering as the turret sweeps through the aim point.
+#define AUTOFIRE_DWELL_FRAMES  3
+// Minimum milliseconds between shots.
+#define AUTOFIRE_COOLDOWN_MS   2000
+
 // ── Mode ──────────────────────────────────────────────────────────────────────
-// false = manual (IR remote + single-char serial)
-// true  = tracking (X/Y serial commands from ESP32-CAM)
-bool trackingMode = false;
+enum Mode : uint8_t { MANUAL, TRACKING, AUTOFIRE };
+Mode currentMode = MANUAL;
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 void shakeHeadYes(int moves = 3);
@@ -85,24 +94,41 @@ void loop() {
         if (IrReceiver.decodedIRData.protocol != UNKNOWN) {
             uint8_t irCmd = IrReceiver.decodedIRData.command;
 
-            // ── Mode toggle sequence ──────────────────────────────────────
-            // Pressing cmd1 four times consecutively switches modes.
-            // Any other button resets the counter.
-            static uint8_t seqCount = 0;
-            if (irCmd == MODE_SEQ_CODE) {
-                seqCount++;
-                if (seqCount >= MODE_SEQ_LEN) {
-                    seqCount      = 0;
-                    trackingMode  = !trackingMode;
-                    homeServos(); // physical acknowledgment of mode change
-                    Serial.println(trackingMode ? "MODE:TRACK" : "MODE:MANUAL");
+            // ── Mode sequence detector ────────────────────────────────────
+            // Tracks consecutive cmd5 presses. On the 4th press, the button
+            // identity determines which sequence completed:
+            //   cmd5 → 5555 sequence  (MANUAL↔TRACKING toggle)
+            //   cmd6 → 5556 sequence  (enter AUTOFIRE)
+            // Any other button resets the counter without executing an action.
+            static uint8_t fiveCount = 0;
+
+            if (irCmd == cmd5) {
+                if (fiveCount < 3) {
+                    fiveCount++;
+                    // Accumulating prefix — don't execute any action yet
+                } else {
+                    // 5555 complete
+                    fiveCount = 0;
+                    if (currentMode == MANUAL) {
+                        currentMode = TRACKING;
+                        Serial.println("MODE:TRACK");
+                    } else {
+                        currentMode = MANUAL;
+                        Serial.println("MODE:MANUAL");
+                    }
+                    homeServos();
                 }
+            } else if (irCmd == cmd6 && fiveCount == 3) {
+                // 5556 complete
+                fiveCount   = 0;
+                currentMode = AUTOFIRE;
+                homeServos();
+                Serial.println("MODE:AUTOFIRE");
             } else {
-                seqCount = 0;
+                fiveCount = 0;
 
                 // ── Manual-mode IR commands ───────────────────────────────
-                // Ignored in tracking mode; camera has control.
-                if (!trackingMode) {
+                if (currentMode == MANUAL) {
                     switch (irCmd) {
                         case up:    upMove(1);            break;
                         case down:  downMove(1);          break;
@@ -114,6 +140,8 @@ void loop() {
                         case cmd2:  shakeHeadNo(3);       break;
                     }
                 }
+                // In TRACKING / AUTOFIRE all movement/fire IR commands are
+                // ignored — the camera has full control.
             }
         }
         IrReceiver.resume();
@@ -122,8 +150,8 @@ void loop() {
     delay(5);
     handleSerialCommands();
 
-    // Watchdog: only needed in tracking mode — stop yaw if ESP32 goes silent
-    if (trackingMode && millis() - lastTrackMs > TRACK_TIMEOUT_MS) {
+    // Watchdog: stop yaw if ESP32 goes silent (tracking modes only)
+    if (currentMode != MANUAL && millis() - lastTrackMs > TRACK_TIMEOUT_MS) {
         yawServo.write(yawStopSpeed);
     }
 }
@@ -217,12 +245,16 @@ void shakeHeadNo(int moves) {
 }
 
 // ── Serial command parser ─────────────────────────────────────────────────────
-// Tracking mode : X<signed_int>Y<signed_int>\n  e.g. "X-45Y23\n"
-// Manual mode   : single letter + \n            e.g. "L\n"
-//                 L/R = yaw, U/D = pitch, F = fire, H = home, Y/N = gestures
+// TRACKING / AUTOFIRE : X<signed_int>Y<signed_int>\n  e.g. "X-45Y23\n"
+// MANUAL              : single letter + \n            e.g. "L\n"
+//                       L/R = yaw, U/D = pitch, F = fire, H = home, Y/N = gestures
 void handleSerialCommands() {
     static char    buf[32];
     static uint8_t pos = 0;
+
+    // Auto-fire state — persists between calls
+    static uint8_t       dwellCount  = 0;
+    static unsigned long lastFireMs  = 0;
 
     while (Serial.available()) {
         char c = Serial.read();
@@ -231,8 +263,8 @@ void handleSerialCommands() {
             buf[pos] = '\0';
             pos = 0;
 
-            if (trackingMode) {
-                // ── Camera tracking commands ──────────────────────────────
+            if (currentMode == TRACKING || currentMode == AUTOFIRE) {
+                // ── Camera X/Y error commands ─────────────────────────────
                 if (buf[0] == 'X') {
                     int ex = atoi(buf + 1);
                     char* p = buf + 1;
@@ -249,6 +281,23 @@ void handleSerialCommands() {
                         int pitchDelta = ey / PITCH_DIV;
                         pitchServoVal = constrain(pitchServoVal - pitchDelta, pitchMin, pitchMax);
                         pitchServo.write(pitchServoVal);
+
+                        // ── Auto-fire logic ───────────────────────────────
+                        if (currentMode == AUTOFIRE) {
+                            bool onTarget = (ex > -AUTOFIRE_AIM_THRESHOLD && ex < AUTOFIRE_AIM_THRESHOLD)
+                                         && (ey > -AUTOFIRE_AIM_THRESHOLD && ey < AUTOFIRE_AIM_THRESHOLD);
+                            if (onTarget) {
+                                dwellCount++;
+                                if (dwellCount >= AUTOFIRE_DWELL_FRAMES
+                                        && millis() - lastFireMs >= AUTOFIRE_COOLDOWN_MS) {
+                                    fire();
+                                    lastFireMs = millis();
+                                    dwellCount = 0;
+                                }
+                            } else {
+                                dwellCount = 0;
+                            }
+                        }
                     }
                 }
             } else {
