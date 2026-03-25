@@ -63,8 +63,8 @@ unsigned long lastTrackMs = 0;
 // Must stay on-target for this many consecutive frames before firing,
 // to avoid triggering as the turret sweeps through the aim point.
 #define AUTOFIRE_DWELL_FRAMES  3
-// Minimum milliseconds between shots.
-#define AUTOFIRE_COOLDOWN_MS   2000
+// While on-target the roll servo spins continuously — no per-shot cooldown.
+// The servo stops the moment the aim drifts outside the threshold.
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
 enum Mode : uint8_t { MANUAL, TRACKING, AUTOFIRE };
@@ -150,9 +150,10 @@ void loop() {
     delay(5);
     handleSerialCommands();
 
-    // Watchdog: stop yaw if ESP32 goes silent (tracking modes only)
+    // Watchdog: stop movement if ESP32 goes silent (tracking modes only)
     if (currentMode != MANUAL && millis() - lastTrackMs > TRACK_TIMEOUT_MS) {
         yawServo.write(yawStopSpeed);
+        rollServo.write(rollStopSpeed); // stop firing if mid-burst
     }
 }
 
@@ -253,8 +254,7 @@ void handleSerialCommands() {
     static uint8_t pos = 0;
 
     // Auto-fire state — persists between calls
-    static uint8_t       dwellCount  = 0;
-    static unsigned long lastFireMs  = 0;
+    static uint8_t dwellCount = 0;
 
     while (Serial.available()) {
         char c = Serial.read();
@@ -283,19 +283,20 @@ void handleSerialCommands() {
                         pitchServo.write(pitchServoVal);
 
                         // ── Auto-fire logic ───────────────────────────────
+                        // Spin the roll servo continuously while on-target;
+                        // stop it the moment aim drifts outside the threshold.
+                        // Dwell guard prevents firing on a transient sweep.
                         if (currentMode == AUTOFIRE) {
                             bool onTarget = (ex > -AUTOFIRE_AIM_THRESHOLD && ex < AUTOFIRE_AIM_THRESHOLD)
                                          && (ey > -AUTOFIRE_AIM_THRESHOLD && ey < AUTOFIRE_AIM_THRESHOLD);
                             if (onTarget) {
                                 dwellCount++;
-                                if (dwellCount >= AUTOFIRE_DWELL_FRAMES
-                                        && millis() - lastFireMs >= AUTOFIRE_COOLDOWN_MS) {
-                                    fire();
-                                    lastFireMs = millis();
-                                    dwellCount = 0;
+                                if (dwellCount >= AUTOFIRE_DWELL_FRAMES) {
+                                    rollServo.write(rollStopSpeed + rollMoveSpeed);
                                 }
                             } else {
                                 dwellCount = 0;
+                                rollServo.write(rollStopSpeed);
                             }
                         }
                     }
