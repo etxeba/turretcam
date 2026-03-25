@@ -7,8 +7,9 @@ Three boards are involved:
 - **ESP32-CAM** (AI Thinker) — handles vision, motion detection, and sends commands
 - **FTDI adapter** (FT232RL) — one-time use only for the initial flash; not needed afterwards
 
-> **HackPack users:** the Nano and its 5 V power rail are already on the turret's PCB. The steps below refer to that PCB as the "power board."
-> **Other builds:** substitute any regulated 5 V / 1 A supply for the power board references.
+> **HackPack users:** the turret's breadboard carries **two voltage rails** — a ~7V VIN rail (for the continuous servos) and a 5V rail (for the Nano, IR receiver, and logic). The ESP32-CAM must connect to the **5V rail only**. 7V will damage the ESP32-CAM. The 5V rail is the row fed from the Nano's 5V pin. Measure with a multimeter if you are unsure which row is which.
+>
+> **Other builds:** substitute any regulated 5V / 1A supply for the "5V rail" references below.
 
 ---
 
@@ -89,14 +90,18 @@ curl "http://<ESP32_IP>/config?hmirror=1&vflip=1"
 
 ## 4. Power Notes
 
-| Board        | Power source              | Current draw (typical)     |
-|--------------|---------------------------|----------------------------|
-| ESP32-CAM    | Shared 5 V rail           | ~250 mA idle, ~500 mA peak |
-| Arduino Nano | Shared 5 V rail (USB-C)   | ~50 mA + servo load        |
-| **Combined** | **Single USB-C supply**   | **~600 mA peak**           |
+| Board | Rail | Current draw (typical) |
+|-------|------|------------------------|
+| ESP32-CAM | 5V (logic rail) | ~250 mA idle, ~500 mA peak |
+| Arduino Nano | 5V (logic rail, via USB-C) | ~50 mA |
+| Yaw + roll servos | ~7V (VIN rail) | ~200–400 mA under load |
+| Pitch servo | 5V (logic rail) | ~100 mA under load |
 
-Make sure your USB-C power supply (or power bank) is rated for at least **1 A**
-to handle the combined peak load.  A 5000 mAh bank gives roughly 6–8 hours.
+The HackPack's included USB-C power bank is sufficient for all of the above.
+Keep it charged above **75%** — servo behaviour becomes unreliable as voltage sags.
+
+> **Non-HackPack builds:** ensure your 5V supply can deliver at least **1A**
+> to cover the ESP32-CAM peak draw plus the Nano and pitch servo.
 
 ---
 

@@ -43,6 +43,19 @@ The ESP32-CAM sends `X<error>Y<error>\n` proportional error commands each frame.
 
 > **Non-HackPack builds:** This firmware will work with any Arduino Nano + 3-servo pan/tilt/fire rig and any NEC-protocol IR remote. You will need to adjust the servo pins, IR codes, and pitch/roll limits in `turret_nano_firmware.ino` to match your hardware (see notes in the Setup section).
 
+### HackPack hardware notes
+
+The HackPack turret routes power through a breadboard with **two voltage rails**:
+
+| Rail | Voltage | Used for |
+|------|---------|----------|
+| Logic / 5V | 5 V | Arduino Nano, IR receiver, ESP32-CAM |
+| VIN | ~7 V | Yaw and roll (continuous) servos |
+
+> **The ESP32-CAM must connect to the 5V rail — not VIN.** 7V will damage it. On the HackPack breadboard the 5V rail is the one fed from the Nano's 5V pin, not the battery's raw output. Check the wire color on your build or measure with a multimeter before connecting.
+
+The included USB-C power bank is adequate for the combined load. Keep it charged above 75% — servos become unreliable as voltage sags. The power bank charges via USB-C and powers the Nano (and through it the ESP32-CAM) via USB-C to the Nano's port.
+
 ---
 
 ## Wiring
@@ -51,13 +64,13 @@ See `docs/WIRING.md` for the full reference with diagrams. Summary:
 
 ### Permanent wiring (3 wires, stays on the turret)
 
-| ESP32-CAM | Power/Nano board | Purpose |
-|-----------|-----------------|---------|
-| **5V** | **5V rail** | Power from the same supply as the Nano |
-| **GND** | **GND** | Common ground |
+| ESP32-CAM | HackPack breadboard | Purpose |
+|-----------|---------------------|---------|
+| **5V** | **5V rail** (Nano 5V row) | Power — **must be 5V, not VIN/7V** |
+| **GND** | **GND rail** | Common ground |
 | **GPIO 14** | **Nano RX (D0)** | Tracking error commands (TX only) |
 
-> **Power:** The ESP32-CAM is powered from the same supply as the Nano. On the HackPack this is the turret's power PCB. On other builds, use any regulated 5 V supply capable of at least **1 A** (covers ~600 mA peak combined for both boards).
+> **Power:** The HackPack breadboard carries two voltage rails. Connect the ESP32-CAM to the **5V rail** — the row fed from the Nano's 5V pin. The board also has a ~7V VIN rail that powers the continuous servos; connecting the ESP32-CAM there will damage it. Measure with a multimeter if unsure. On other builds use any regulated 5V / 1A supply.
 
 > **D0 / Serial conflict:** GPIO 14 connects to the Nano's hardware UART RX pin (D0), which is shared with the USB-Serial chip used for programming and Serial Monitor. **Disconnect the GPIO 14 wire before uploading new firmware to the Nano or using Serial Monitor**, then reconnect it afterwards. Failing to do so will cause upload errors and garbled serial output.
 
