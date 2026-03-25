@@ -35,11 +35,13 @@ The ESP32-CAM sends `X<error>Y<error>\n` proportional error commands each frame.
 
 | Item | ~Price | Notes |
 |------|--------|-------|
-| [CrunchLabs Hack Pack turret](https://www.crunchlabs.com/pages/ir-turret-landing) | $66 | Includes Nano, servos, IR remote |
+| [CrunchLabs Hack Pack turret](https://www.crunchlabs.com/pages/ir-turret-landing) | $66 | Includes Arduino Nano, 3 servos, IR remote, and power PCB |
 | [ESP32-CAM (AI Thinker)](https://www.amazon.com/s?k=esp32-cam+ai+thinker) | $10–14 | With OV2640 camera module |
 | FTDI USB-to-TTL adapter (FT232RL) | ~$7 | One-time initial flash only; OTA after that |
 | Female-to-female jumper wires | ~$5 | 3 wires needed permanently |
 | **Total** | **~$95** | |
+
+> **Non-HackPack builds:** This firmware will work with any Arduino Nano + 3-servo pan/tilt/fire rig and any NEC-protocol IR remote. You will need to adjust the servo pins, IR codes, and pitch/roll limits in `turret_nano_firmware.ino` to match your hardware (see notes in the Setup section).
 
 ---
 
@@ -49,13 +51,15 @@ See `docs/WIRING.md` for the full reference with diagrams. Summary:
 
 ### Permanent wiring (3 wires, stays on the turret)
 
-| ESP32-CAM | Breakout board | Purpose |
-|-----------|---------------|---------|
-| **5V** | **5V** | Power from breakout board |
+| ESP32-CAM | Power/Nano board | Purpose |
+|-----------|-----------------|---------|
+| **5V** | **5V rail** | Power from the same supply as the Nano |
 | **GND** | **GND** | Common ground |
 | **GPIO 14** | **Nano RX (D0)** | Tracking error commands (TX only) |
 
-> The ESP32-CAM is powered from the same breakout board that powers the Nano. Your USB-C supply must support at least **1 A** to cover both boards (~600 mA peak combined).
+> **Power:** The ESP32-CAM is powered from the same supply as the Nano. On the HackPack this is the turret's power PCB. On other builds, use any regulated 5 V supply capable of at least **1 A** (covers ~600 mA peak combined for both boards).
+
+> **D0 / Serial conflict:** GPIO 14 connects to the Nano's hardware UART RX pin (D0), which is shared with the USB-Serial chip used for programming and Serial Monitor. **Disconnect the GPIO 14 wire before uploading new firmware to the Nano or using Serial Monitor**, then reconnect it afterwards. Failing to do so will cause upload errors and garbled serial output.
 
 ### FTDI wiring (one-time flash only)
 
@@ -78,19 +82,29 @@ See `docs/WIRING.md` for the full reference with diagrams. Summary:
    ```
    https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
    ```
-3. **Tools → Board → Boards Manager** → search `esp32` → install **esp32 by Espressif Systems**
+3. **Tools → Board → Boards Manager** → search `esp32` → install **esp32 by Espressif Systems** (tested with 2.x)
 4. Install libraries via **Tools → Manage Libraries**:
-   - `IRremote` by Armin Joachimsmeyer (Nano)
+   - `IRremote` by Armin Joachimsmeyer — **version 4.x** (Nano)
    - `Servo` (Nano, usually pre-installed)
 
 ### 2 — Flash the Arduino Nano
 
 1. Open `turret_nano_firmware/turret_nano_firmware.ino` in Arduino IDE
-2. Select board: **Tools → Board → Arduino AVR Boards → Arduino Nano**
-3. Select the Nano's USB-C serial port
-4. Click **Upload**
+2. **If using non-HackPack hardware**, check these values near the top of the file and adjust to match your build:
+   ```cpp
+   yawServo.attach(10);    // continuous rotation — base spin
+   pitchServo.attach(11);  // positional — up/down tilt
+   rollServo.attach(12);   // continuous rotation — barrel/fire
 
-No code changes needed — WiFi credentials and servo config live only on the ESP32.
+   int pitchMax = 150;     // maximum pitch angle (degrees)
+   int pitchMin = 33;      // minimum pitch angle (degrees)
+   ```
+   Also verify the IR codes match your remote — the defaults are for the NEC remote included with the HackPack. To find codes for a different remote, temporarily add `IrReceiver.printIRResultShort(&Serial);` inside the `IrReceiver.decode()` block, upload, open Serial Monitor at 9600 baud, and press each button.
+3. **Disconnect the GPIO 14 wire** from D0 before uploading (see D0 conflict note above)
+4. Select board: **Tools → Board → Arduino AVR Boards → Arduino Nano**
+5. Select the Nano's USB-C serial port
+6. Click **Upload**
+7. Reconnect the GPIO 14 wire after uploading
 
 ### 3 — Flash the ESP32-CAM (initial, wired)
 
@@ -104,6 +118,7 @@ No code changes needed — WiFi credentials and servo config live only on the ES
 4. **Bridge GPIO 0 to GND** on the ESP32-CAM
 5. Select board: **Tools → Board → esp32 → AI Thinker ESP32-CAM**
 6. Select the FTDI's serial port
+   - Partition scheme: **Tools → Partition Scheme → Default 4MB with spiffs** (required for NVS config storage)
 7. Click **Upload**; when the IDE shows `Connecting...` press the **RST** button once
 8. After upload: **remove the GPIO 0 bridge**, then press **RST** to boot normally
 9. Open Serial Monitor at **115200 baud** — you should see the IP address printed
