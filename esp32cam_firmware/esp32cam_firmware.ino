@@ -17,9 +17,12 @@
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+
+Preferences prefs;
 
 // =========================================================
 // WiFi credentials — update before flashing
@@ -429,7 +432,13 @@ void handleConfig() {
     s->set_vflip(s, cfg.vflip ? 1 : 0);
   }
 
-  char buf[256];
+  bool saved = false;
+  if (server.hasArg("save") && server.arg("save").toInt() == 1) {
+    saveConfig();
+    saved = true;
+  }
+
+  char buf[280];
   snprintf(buf, sizeof(buf),
     "{"
       "\"threshold\":%d,"
@@ -438,17 +447,48 @@ void handleConfig() {
       "\"hmirror\":%s,"
       "\"vflip\":%s,"
       "\"offset_x\":%d,"
-      "\"offset_y\":%d"
+      "\"offset_y\":%d,"
+      "\"saved\":%s"
     "}",
     cfg.threshold, cfg.min_pixels,
     cfg.enabled ? "true" : "false",
     cfg.hmirror  ? "true" : "false",
     cfg.vflip    ? "true" : "false",
-    cfg.offset_x, cfg.offset_y
+    cfg.offset_x, cfg.offset_y,
+    saved ? "true" : "false"
   );
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", buf);
+}
+
+// =========================================================
+// NVS persistence
+// =========================================================
+void saveConfig() {
+  prefs.begin("turret", false);
+  prefs.putInt("threshold",  cfg.threshold);
+  prefs.putInt("min_pixels", cfg.min_pixels);
+  prefs.putBool("enabled",   cfg.enabled);
+  prefs.putBool("hmirror",   cfg.hmirror);
+  prefs.putBool("vflip",     cfg.vflip);
+  prefs.putInt("offset_x",   cfg.offset_x);
+  prefs.putInt("offset_y",   cfg.offset_y);
+  prefs.end();
+  Serial.println("Config saved to NVS");
+}
+
+void loadConfig() {
+  prefs.begin("turret", true);  // read-only
+  cfg.threshold  = prefs.getInt("threshold",  cfg.threshold);
+  cfg.min_pixels = prefs.getInt("min_pixels", cfg.min_pixels);
+  cfg.enabled    = prefs.getBool("enabled",   cfg.enabled);
+  cfg.hmirror    = prefs.getBool("hmirror",   cfg.hmirror);
+  cfg.vflip      = prefs.getBool("vflip",     cfg.vflip);
+  cfg.offset_x   = prefs.getInt("offset_x",  cfg.offset_x);
+  cfg.offset_y   = prefs.getInt("offset_y",  cfg.offset_y);
+  prefs.end();
+  Serial.printf("Config loaded from NVS (offset %d, %d)\n", cfg.offset_x, cfg.offset_y);
 }
 
 // =========================================================
@@ -457,6 +497,8 @@ void handleConfig() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n\n=== HackPack Turret Tracker — ESP32-CAM ===");
+
+  loadConfig();
 
   // UART2 → Nano (TX only; RX unused)
   Serial2.begin(UART_BAUD, SERIAL_8N1, -1, UART_TX_PIN);
