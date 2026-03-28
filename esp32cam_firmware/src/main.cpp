@@ -1,4 +1,4 @@
-// esp32cam_firmware.ino
+// main.cpp
 // HackPack Turret Tracker — ESP32-CAM firmware
 //
 // Motion detection via frame differencing. Sends proportional X/Y tracking
@@ -13,7 +13,9 @@
 //   http://<IP>/status     — JSON tracking stats
 //   http://<IP>/config     — GET / SET tracking parameters
 
+#include <Arduino.h>
 #include "esp_camera.h"
+#include "img_converters.h"
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <WebServer.h>
@@ -23,6 +25,9 @@
 #include <freertos/semphr.h>
 
 Preferences prefs;
+
+// Forward declaration (required in C++ — Arduino IDE generated this automatically)
+void saveConfig();
 
 // =========================================================
 // WiFi credentials — update before flashing
@@ -87,7 +92,8 @@ Config cfg;
 // =========================================================
 // State
 // =========================================================
-uint8_t* prev_frame   = nullptr;
+uint8_t* prev_frame       = nullptr;  // grayscale, frame_width * frame_height bytes
+uint8_t* jpeg_decode_buf  = nullptr;  // RGB888 decode workspace, frame_width * frame_height * 3 bytes
 int      frame_width  = 0;
 int      frame_height = 0;
 size_t   frame_bytes  = 0;
@@ -130,12 +136,12 @@ bool initCamera() {
   config.pin_pclk     = PCLK_GPIO_NUM;
   config.pin_vsync    = VSYNC_GPIO_NUM;
   config.pin_href     = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size   = FRAMESIZE_QVGA;  // 320 × 240
   config.jpeg_quality = 12;
   config.fb_count     = 2;
@@ -226,24 +232,36 @@ void trackingTask(void* pvParameters) {
 
     if (!fb) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
 
-    if (fb->len != frame_bytes || !prev_frame) {
+    if (!prev_frame || !jpeg_decode_buf) {
       esp_camera_fb_return(fb);
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
 
-    float cx = 0.0f, cy = 0.0f;
-    int   motion_pixels = 0, global_diff_pixels = 0;
-
-    bool motion = detectMotion(fb->buf, prev_frame,
-                               frame_width, frame_height,
-                               cx, cy, motion_pixels, global_diff_pixels);
-
-    memcpy(prev_frame, fb->buf, frame_bytes);
+    // Decode JPEG → RGB888 into jpeg_decode_buf, then return the frame buffer promptly.
+    bool decoded = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, jpeg_decode_buf);
 
     xSemaphoreTake(camMutex, pdMS_TO_TICKS(10));
     esp_camera_fb_return(fb);
     xSemaphoreGive(camMutex);
+
+    if (!decoded) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+
+    // Convert RGB888 → grayscale in-place (write index i always <= read index 3i).
+    for (size_t i = 0; i < frame_bytes; i++) {
+      jpeg_decode_buf[i] = ((uint16_t)jpeg_decode_buf[i * 3]     * 77u +
+                            (uint16_t)jpeg_decode_buf[i * 3 + 1] * 150u +
+                            (uint16_t)jpeg_decode_buf[i * 3 + 2] * 29u) >> 8;
+    }
+
+    float cx = 0.0f, cy = 0.0f;
+    int   motion_pixels = 0, global_diff_pixels = 0;
+
+    bool motion = detectMotion(jpeg_decode_buf, prev_frame,
+                               frame_width, frame_height,
+                               cx, cy, motion_pixels, global_diff_pixels);
+
+    memcpy(prev_frame, jpeg_decode_buf, frame_bytes);
 
     // Seed baseline from the very first frame
     if (baselineDiff < 0.0f) baselineDiff = (float)global_diff_pixels;
@@ -309,11 +327,15 @@ void trackingTask(void* pvParameters) {
 void handleStream() {
   WiFiClient client = streamServer.client();
 
-  streamServer.sendHeader("Access-Control-Allow-Origin", "*");
-  streamServer.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  streamServer.sendHeader("Pragma", "no-cache");
-  streamServer.sendHeader("Expires", "-1");
-  streamServer.send(200, "multipart/x-mixed-replace; boundary=frame");
+  // Write HTTP headers directly to the socket — WebServer::send() terminates
+  // the response (Content-Length: 0 + connection close) which kills the stream.
+  client.print("HTTP/1.1 200 OK\r\n"
+               "Access-Control-Allow-Origin: *\r\n"
+               "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+               "Pragma: no-cache\r\n"
+               "Expires: -1\r\n"
+               "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+               "\r\n");
 
   while (client.connected()) {
     if (xSemaphoreTake(camMutex, pdMS_TO_TICKS(500)) != pdTRUE) continue;
@@ -322,22 +344,16 @@ void handleStream() {
 
     if (!fb) { delay(10); continue; }
 
-    uint8_t* jpg_buf = nullptr;
-    size_t   jpg_len = 0;
-    bool ok = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
+    // Camera outputs JPEG directly — no conversion needed.
+    client.print("--frame\r\n");
+    client.print("Content-Type: image/jpeg\r\n");
+    client.printf("Content-Length: %u\r\n\r\n", fb->len);
+    client.write(fb->buf, fb->len);
+    client.print("\r\n");
 
     xSemaphoreTake(camMutex, pdMS_TO_TICKS(10));
     esp_camera_fb_return(fb);
     xSemaphoreGive(camMutex);
-
-    if (ok && jpg_buf) {
-      client.print("--frame\r\n");
-      client.print("Content-Type: image/jpeg\r\n");
-      client.printf("Content-Length: %u\r\n\r\n", jpg_len);
-      client.write(jpg_buf, jpg_len);
-      client.print("\r\n");
-      free(jpg_buf);
-    }
 
     delay(50);
   }
@@ -354,19 +370,13 @@ void handleCapture() {
 
   if (!fb) { server.send(500, "text/plain", "Camera error"); return; }
 
-  uint8_t* jpg_buf = nullptr;
-  size_t   jpg_len = 0;
-  bool ok = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
+  // Camera outputs JPEG directly — send raw bytes, then return the frame buffer.
+  server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
 
   xSemaphoreTake(camMutex, pdMS_TO_TICKS(10));
   esp_camera_fb_return(fb);
   xSemaphoreGive(camMutex);
-
-  if (!ok || !jpg_buf) { server.send(500, "text/plain", "JPEG encode error"); return; }
-
-  server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
-  server.send_P(200, "image/jpeg", (const char*)jpg_buf, jpg_len);
-  free(jpg_buf);
 }
 
 // HTTP: JSON status
@@ -515,11 +525,12 @@ void setup() {
   if (fb) {
     frame_width  = fb->width;
     frame_height = fb->height;
-    frame_bytes  = fb->len;
-    prev_frame   = (uint8_t*)malloc(frame_bytes);
-    if (prev_frame) memcpy(prev_frame, fb->buf, frame_bytes);
+    frame_bytes  = (size_t)fb->width * fb->height;  // grayscale size for motion buffers
+    prev_frame      = (uint8_t*)ps_malloc(frame_bytes);
+    jpeg_decode_buf = (uint8_t*)ps_malloc(frame_bytes * 3);  // RGB888 decode workspace
+    if (prev_frame) memset(prev_frame, 0, frame_bytes);
     esp_camera_fb_return(fb);
-    Serial.printf("Frame: %d x %d (%d bytes)\n", frame_width, frame_height, frame_bytes);
+    Serial.printf("Frame: %d x %d (%d px, JPEG out)\n", frame_width, frame_height, frame_bytes);
   } else {
     Serial.println("FATAL: cannot read first frame — rebooting");
     delay(5000);

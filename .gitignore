@@ -1,3 +1,7 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+# PlatformIO build artifacts
+esp32cam_firmware/.pio/
+esp32cam_firmware/.theia/
