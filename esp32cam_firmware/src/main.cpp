@@ -23,17 +23,15 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include "wifi_credentials.h"
 
 Preferences prefs;
 
 // Forward declaration (required in C++ — Arduino IDE generated this automatically)
 void saveConfig();
 
-// =========================================================
-// WiFi credentials — update before flashing
-// =========================================================
-const char* ssid     = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+const char* ssid     = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
 // =========================================================
 // AI Thinker ESP32-CAM pin map
@@ -92,6 +90,7 @@ Config cfg;
 // =========================================================
 // State
 // =========================================================
+TaskHandle_t trackingTaskHandle = nullptr;
 uint8_t* prev_frame       = nullptr;  // grayscale, frame_width * frame_height bytes
 uint8_t* jpeg_decode_buf  = nullptr;  // RGB888 decode workspace, frame_width * frame_height * 3 bytes
 int      frame_width  = 0;
@@ -557,7 +556,11 @@ void setup() {
   }
 
   ArduinoOTA.setHostname("turret-cam");
-  ArduinoOTA.onStart([]()            { Serial.println("OTA: start");    });
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA: start — suspending tracking and camera");
+    if (trackingTaskHandle) vTaskSuspend(trackingTaskHandle);
+    esp_camera_deinit();
+  });
   ArduinoOTA.onEnd([]()              { Serial.println("OTA: end");      });
   ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
     Serial.printf("OTA: %u%%\n", p * 100 / t);
@@ -582,7 +585,7 @@ void setup() {
     8192,
     nullptr,
     1,
-    nullptr,
+    &trackingTaskHandle,
     0
   );
 
