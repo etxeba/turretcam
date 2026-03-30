@@ -19,9 +19,9 @@ Connect these wires and leave them on the turret permanently.
 
 | ESP32-CAM pin | Power board / supply | Wire color (suggestion) | Purpose |
 |---------------|----------------------|------------------------|---------|
-| **5V**        | **5V rail**          | Red                    | Power (shared with Nano)            |
+| **5V**        | **5V rail**          | Red                    | Power (shared with Nano)             |
 | **GND**       | **GND**              | Black                  | Common ground                        |
-| **GPIO 14**   | **Nano RX (D0)**     | Yellow                 | ESP32 TX → Nano RX (servo commands) |
+| **GPIO 14**   | **Nano D4**          | Yellow                 | ESP32 TX → Nano SoftwareSerial RX   |
 
 > **Power:** The ESP32-CAM shares the same 5 V supply as the Nano. The supply
 > must be able to source at least **600 mA** combined (~500 mA peak for the
@@ -30,10 +30,9 @@ Connect these wires and leave them on the turret permanently.
 > **Data flow is one-way:** the ESP32-CAM sends commands to the Nano; the Nano
 > sends nothing back.  Only three wires are needed (5V, GND, GPIO 14).
 >
-> **D0 / Serial conflict:** GPIO 14 connects to the Nano's hardware UART RX
-> pin (D0), which is shared with the USB-Serial chip.  **Disconnect the GPIO 14
-> wire before uploading new firmware to the Nano or using Serial Monitor**,
-> then reconnect it afterwards.
+> **No serial conflict:** GPIO 14 connects to D4, which runs SoftwareSerial.
+> The Nano's hardware UART (D0/D1) is free for USB flashing and Serial Monitor
+> at all times — no wire changes needed when uploading firmware.
 
 ### Diagram
 
@@ -42,7 +41,7 @@ Connect these wires and leave them on the turret permanently.
 ──────────────────────────────────────────────────────────────────────────────
 5V ─────────────────────────▶ 5V
 GND ────────────────────────── GND ────────────────────────────── GND
-                               GPIO 14 (TX) ──────────────────▶ RX (D0)
+                               GPIO 14 (TX) ──────────────────▶ D4 (SoftwareSerial RX)
 ```
 
 ---
@@ -109,8 +108,8 @@ Keep it charged above **75%** — servo behaviour becomes unreliable as voltage 
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| Nano receives garbage / nothing | TX wire swapped | Confirm GPIO 14 → Nano RX (D0) |
-| Nano upload fails / Serial Monitor garbled | GPIO 14 still connected during upload | Disconnect GPIO 14 wire from D0 before uploading or opening Serial Monitor |
+| Nano receives garbage / nothing | TX wire swapped | Confirm GPIO 14 → Nano D4 |
+| Nano upload fails / Serial Monitor garbled | Wrong pin wired | GPIO 14 should go to D4, not D0 — D0 must remain free for USB |
 | ESP32-CAM won't enter flash mode | GPIO 0 not grounded | Re-seat jumper before plugging FTDI |
 | Servos twitch at startup | Both boards power up at different times | Add a 1-second `delay(1000)` at the start of Nano `setup()` |
 | Camera image is mirrored/flipped | Mount orientation | `curl "http://<IP>/config?hmirror=1"` or `?vflip=1` |

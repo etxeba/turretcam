@@ -68,11 +68,11 @@ See `docs/WIRING.md` for the full reference with diagrams. Summary:
 |-----------|---------------------|---------|
 | **5V** | **5V rail** (Nano 5V row) | Power — **must be 5V, not VIN/7V** |
 | **GND** | **GND rail** | Common ground |
-| **GPIO 14** | **Nano RX (D0)** | Tracking error commands (TX only) |
+| **GPIO 14** | **Nano D4** | Tracking error commands (TX only, SoftwareSerial) |
 
 > **Power:** The HackPack breadboard carries two voltage rails. Connect the ESP32-CAM to the **5V rail** — the row fed from the Nano's 5V pin. The board also has a ~7V VIN rail that powers the continuous servos; connecting the ESP32-CAM there will damage it. Measure with a multimeter if unsure. On other builds use any regulated 5V / 1A supply.
 
-> **D0 / Serial conflict:** GPIO 14 connects to the Nano's hardware UART RX pin (D0), which is shared with the USB-Serial chip used for programming and Serial Monitor. **Disconnect the GPIO 14 wire before uploading new firmware to the Nano or using Serial Monitor**, then reconnect it afterwards. Failing to do so will cause upload errors and garbled serial output.
+> **No serial conflict:** GPIO 14 connects to D4 (SoftwareSerial), not D0. The Nano's hardware UART (D0/D1) stays free for USB flashing and Serial Monitor at all times — no wire changes needed when uploading firmware.
 
 ### FTDI wiring (one-time flash only)
 
@@ -113,11 +113,9 @@ See `docs/WIRING.md` for the full reference with diagrams. Summary:
    int pitchMin = 33;      // minimum pitch angle (degrees)
    ```
    Also verify the IR codes match your remote — the defaults are for the NEC remote included with the HackPack. To find codes for a different remote, temporarily add `IrReceiver.printIRResultShort(&Serial);` inside the `IrReceiver.decode()` block, upload, open Serial Monitor at 9600 baud, and press each button.
-3. **Disconnect the GPIO 14 wire** from D0 before uploading (see D0 conflict note above)
-4. Select board: **Tools → Board → Arduino AVR Boards → Arduino Nano**
-5. Select the Nano's USB-C serial port
-6. Click **Upload**
-7. Reconnect the GPIO 14 wire after uploading
+3. Select board: **Tools → Board → Arduino AVR Boards → Arduino Nano**
+4. Select the Nano's USB-C serial port
+5. Click **Upload** — no need to disconnect any wires
 
 ### 3 — Flash the ESP32-CAM (initial, wired)
 

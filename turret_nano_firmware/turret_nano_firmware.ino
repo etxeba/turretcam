@@ -7,6 +7,10 @@
 #include <Arduino.h>
 #include <Servo.h>
 #include <IRremote.hpp>
+#include <SoftwareSerial.h>
+
+// ESP32-CAM TX → Nano D4. RX-only; Nano never transmits back.
+SoftwareSerial camSerial(4, -1);
 
 // ── IR button codes (NEC protocol) ───────────────────────────────────────────
 #define DECODE_NEC
@@ -78,6 +82,7 @@ void handleSerialCommands();
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(9600);
+    camSerial.begin(9600);
 
     yawServo.attach(10);
     pitchServo.attach(11);
@@ -246,28 +251,27 @@ void shakeHeadNo(int moves) {
 }
 
 // ── Serial command parser ─────────────────────────────────────────────────────
-// TRACKING / AUTOFIRE : X<signed_int>Y<signed_int>\n  e.g. "X-45Y23\n"
-// MANUAL              : single letter + \n            e.g. "L\n"
-//                       L/R = yaw, U/D = pitch, F = fire, H = home, Y/N = gestures
+// camSerial (D4) : X<signed_int>Y<signed_int>\n  from ESP32-CAM e.g. "X-45Y23\n"
+// Serial    (D0) : single letter + \n            from USB        e.g. "L\n"
+//                  L/R = yaw, U/D = pitch, F = fire, H = home, Y/N = gestures
 void handleSerialCommands() {
-    static char    buf[32];
-    static uint8_t pos = 0;
 
-    // Auto-fire state — persists between calls
-    static uint8_t dwellCount = 0;
+    // ── Camera stream (SoftwareSerial D4) — X/Y tracking data ────────────────
+    {
+        static char    camBuf[32];
+        static uint8_t camPos     = 0;
+        static uint8_t dwellCount = 0;
 
-    while (Serial.available()) {
-        char c = Serial.read();
-        if (c == '\n' || c == '\r') {
-            if (pos == 0) continue;
-            buf[pos] = '\0';
-            pos = 0;
+        while (camSerial.available()) {
+            char c = camSerial.read();
+            if (c == '\n' || c == '\r') {
+                if (camPos == 0) continue;
+                camBuf[camPos] = '\0';
+                camPos = 0;
 
-            if (currentMode == TRACKING || currentMode == AUTOFIRE) {
-                // ── Camera X/Y error commands ─────────────────────────────
-                if (buf[0] == 'X') {
-                    int ex = atoi(buf + 1);
-                    char* p = buf + 1;
+                if ((currentMode == TRACKING || currentMode == AUTOFIRE) && camBuf[0] == 'X') {
+                    int ex = atoi(camBuf + 1);
+                    char* p = camBuf + 1;
                     while (*p && *p != 'Y') p++;
                     if (*p == 'Y') {
                         int ey = atoi(p + 1);
@@ -283,9 +287,6 @@ void handleSerialCommands() {
                         pitchServo.write(pitchServoVal);
 
                         // ── Auto-fire logic ───────────────────────────────
-                        // Spin the roll servo continuously while on-target;
-                        // stop it the moment aim drifts outside the threshold.
-                        // Dwell guard prevents firing on a transient sweep.
                         if (currentMode == AUTOFIRE) {
                             bool onTarget = (ex > -AUTOFIRE_AIM_THRESHOLD && ex < AUTOFIRE_AIM_THRESHOLD)
                                          && (ey > -AUTOFIRE_AIM_THRESHOLD && ey < AUTOFIRE_AIM_THRESHOLD);
@@ -301,21 +302,39 @@ void handleSerialCommands() {
                         }
                     }
                 }
-            } else {
-                // ── Manual serial commands ────────────────────────────────
-                switch (buf[0]) {
-                    case 'L': case 'l': leftMove(1);    break;
-                    case 'R': case 'r': rightMove(1);   break;
-                    case 'U': case 'u': upMove(1);      break;
-                    case 'D': case 'd': downMove(1);    break;
-                    case 'F': case 'f': fire();         break;
-                    case 'H': case 'h': homeServos();   break;
-                    case 'Y': case 'y': shakeHeadYes(); break;
-                    case 'N': case 'n': shakeHeadNo();  break;
-                }
+            } else if (camPos < sizeof(camBuf) - 1) {
+                camBuf[camPos++] = c;
             }
-        } else if (pos < sizeof(buf) - 1) {
-            buf[pos++] = c;
+        }
+    }
+
+    // ── USB serial (hardware Serial D0) — manual letter commands ─────────────
+    {
+        static char    usbBuf[32];
+        static uint8_t usbPos = 0;
+
+        while (Serial.available()) {
+            char c = Serial.read();
+            if (c == '\n' || c == '\r') {
+                if (usbPos == 0) continue;
+                usbBuf[usbPos] = '\0';
+                usbPos = 0;
+
+                if (currentMode == MANUAL) {
+                    switch (usbBuf[0]) {
+                        case 'L': case 'l': leftMove(1);    break;
+                        case 'R': case 'r': rightMove(1);   break;
+                        case 'U': case 'u': upMove(1);      break;
+                        case 'D': case 'd': downMove(1);    break;
+                        case 'F': case 'f': fire();         break;
+                        case 'H': case 'h': homeServos();   break;
+                        case 'Y': case 'y': shakeHeadYes(); break;
+                        case 'N': case 'n': shakeHeadNo();  break;
+                    }
+                }
+            } else if (usbPos < sizeof(usbBuf) - 1) {
+                usbBuf[usbPos++] = c;
+            }
         }
     }
 }
