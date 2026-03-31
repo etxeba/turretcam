@@ -52,23 +52,25 @@ int rollStopSpeed = 90;
 int rollMoveSpeed = 90;
 int rollPrecision = 158;  // ms for ~60° (one dart)
 
-// ── Tracking gains (integer arithmetic, no float library) ────────────────────
-#define YAW_DIV   2    // error / YAW_DIV   = yaw speed offset  (±50 max)
-#define PITCH_DIV 20   // error / PITCH_DIV = pitch delta deg    (±5 max)
-
 // Stop yaw if no tracking command received within this window (ms)
 #define TRACK_TIMEOUT_MS 250
 unsigned long lastTrackMs = 0;
 
 // ── Auto-fire parameters ──────────────────────────────────────────────────────
-// Target is considered "aimed" when both X and Y errors are within this value
-// (out of ±100). 15 ≈ within 15% of half-frame width/height.
 #define AUTOFIRE_AIM_THRESHOLD 15
-// Must stay on-target for this many consecutive frames before firing,
-// to avoid triggering as the turret sweeps through the aim point.
-#define AUTOFIRE_DWELL_FRAMES  3
-// While on-target the roll servo spins continuously — no per-shot cooldown.
-// The servo stops the moment the aim drifts outside the threshold.
+#define AUTOFIRE_DWELL_FRAMES  8   // ~0.5s at 15 FPS from motion detection
+
+// ── Scan parameters ──────────────────────────────────────────────────────────
+#define SCAN_YAW_SPEED    30   // slow speed offset (vs 90 for full)
+#define SCAN_YAW_PULSE_MS 100  // ms per scan step
+#define SCAN_STEPS_PER_SWEEP 15 // steps before reversing direction
+bool scanRight       = true;
+int  scanStepCount   = 0;
+int  scanPitchLevel  = 0;      // cycles through 3 pitch levels at reversals
+
+// ── Tracking state (for serial output) ───────────────────────────────────────
+bool wasTracking     = false;   // true if last cam command was a track (not scan)
+int  engageCount     = 0;       // number of fire events (kill counter)
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
 enum Mode : uint8_t { MANUAL, TRACKING, AUTOFIRE };
@@ -78,6 +80,8 @@ Mode currentMode = MANUAL;
 void shakeHeadYes(int moves = 3);
 void shakeHeadNo(int moves = 3);
 void handleSerialCommands();
+void weaponsCheck();
+void printModeBanner(Mode m);
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
@@ -91,6 +95,21 @@ void setup() {
     IrReceiver.begin(9, DISABLE_LED_FEEDBACK);
 
     homeServos();
+
+    Serial.println(F(""));
+    Serial.println(F("==================================="));
+    Serial.println(F("  TURRET DEFENSE SYSTEM v2.0"));
+    Serial.println(F("  Motion-Tracking Sentry"));
+    Serial.println(F("==================================="));
+    Serial.println(F("[SYS] Servos........OK"));
+    Serial.println(F("[SYS] IR Receiver...OK"));
+    Serial.println(F("[SYS] Camera Link...OK"));
+    Serial.println(F("[SYS] Mode: MANUAL"));
+    Serial.println(F("[SYS] Ready. Use IR 5-5-5-5 for"));
+    Serial.println(F("      TRACKING or 5-5-5-6 for"));
+    Serial.println(F("      AUTOFIRE."));
+    Serial.println(F("==================================="));
+    Serial.println(F(""));
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -100,35 +119,30 @@ void loop() {
             uint8_t irCmd = IrReceiver.decodedIRData.command;
 
             // ── Mode sequence detector ────────────────────────────────────
-            // Tracks consecutive cmd5 presses. On the 4th press, the button
-            // identity determines which sequence completed:
-            //   cmd5 → 5555 sequence  (MANUAL↔TRACKING toggle)
-            //   cmd6 → 5556 sequence  (enter AUTOFIRE)
-            // Any other button resets the counter without executing an action.
             static uint8_t fiveCount = 0;
 
             if (irCmd == cmd5) {
                 if (fiveCount < 3) {
                     fiveCount++;
-                    // Accumulating prefix — don't execute any action yet
                 } else {
                     // 5555 complete
                     fiveCount = 0;
                     if (currentMode == MANUAL) {
                         currentMode = TRACKING;
-                        Serial.println("MODE:TRACK");
+                        printModeBanner(TRACKING);
+                        weaponsCheck();
                     } else {
                         currentMode = MANUAL;
-                        Serial.println("MODE:MANUAL");
+                        printModeBanner(MANUAL);
+                        homeServos();
                     }
-                    homeServos();
                 }
             } else if (irCmd == cmd6 && fiveCount == 3) {
                 // 5556 complete
                 fiveCount   = 0;
                 currentMode = AUTOFIRE;
-                homeServos();
-                Serial.println("MODE:AUTOFIRE");
+                printModeBanner(AUTOFIRE);
+                weaponsCheck();
             } else {
                 fiveCount = 0;
 
@@ -145,8 +159,6 @@ void loop() {
                         case cmd2:  shakeHeadNo(3);       break;
                     }
                 }
-                // In TRACKING / AUTOFIRE all movement/fire IR commands are
-                // ignored — the camera has full control.
             }
         }
         IrReceiver.resume();
@@ -158,7 +170,7 @@ void loop() {
     // Watchdog: stop movement if ESP32 goes silent (tracking modes only)
     if (currentMode != MANUAL && millis() - lastTrackMs > TRACK_TIMEOUT_MS) {
         yawServo.write(yawStopSpeed);
-        rollServo.write(rollStopSpeed); // stop firing if mid-burst
+        rollServo.write(rollStopSpeed);
     }
 }
 
@@ -250,13 +262,108 @@ void shakeHeadNo(int moves) {
     }
 }
 
+// ── Weapons check animation ─────────────────────────────────────────────────
+// Quick servo sweep when entering tracking/autofire — looks cool
+void weaponsCheck() {
+    Serial.println(F("[SYS] Running systems check..."));
+
+    // Quick yaw left-right
+    yawServo.write(yawStopSpeed + 60);
+    delay(120);
+    yawServo.write(yawStopSpeed - 60);
+    delay(240);
+    yawServo.write(yawStopSpeed + 60);
+    delay(120);
+    yawServo.write(yawStopSpeed);
+    delay(50);
+
+    // Quick pitch up-down
+    pitchServo.write(pitchMax - 10);
+    delay(200);
+    pitchServo.write(pitchMin + 10);
+    delay(200);
+
+    // Barrel spin
+    rollServo.write(rollStopSpeed + rollMoveSpeed);
+    delay(200);
+    rollServo.write(rollStopSpeed);
+    delay(50);
+
+    homeServos();
+
+    Serial.println(F("[SYS] All systems nominal."));
+    Serial.println(F("[SYS] Sentry active.\n"));
+
+    // Reset scan state
+    scanRight      = true;
+    scanStepCount  = 0;
+    scanPitchLevel = 0;
+    wasTracking    = false;
+}
+
+// ── Mode banner ──────────────────────────────────────────────────────────────
+void printModeBanner(Mode m) {
+    Serial.println(F(""));
+    Serial.println(F("============================="));
+    switch (m) {
+        case TRACKING:
+            Serial.println(F("  TRACKING MODE ACTIVATED"));
+            Serial.println(F("  Turret is autonomous."));
+            break;
+        case AUTOFIRE:
+            Serial.println(F("  !!! AUTOFIRE ENGAGED !!!"));
+            Serial.println(F("  Weapons hot. Stand clear."));
+            break;
+        case MANUAL:
+            Serial.println(F("  MANUAL MODE"));
+            Serial.println(F("  IR remote control active."));
+            break;
+    }
+    Serial.println(F("============================="));
+}
+
+// ── Scan step ────────────────────────────────────────────────────────────────
+void doScanStep() {
+    // One slow yaw step in current direction
+    if (scanRight) {
+        yawServo.write(yawStopSpeed - SCAN_YAW_SPEED);
+    } else {
+        yawServo.write(yawStopSpeed + SCAN_YAW_SPEED);
+    }
+    delay(SCAN_YAW_PULSE_MS);
+    yawServo.write(yawStopSpeed);
+
+    scanStepCount++;
+
+    // Print scan direction with visual indicator
+    if (scanStepCount % 3 == 0) {  // don't spam every single step
+        if (scanRight) {
+            Serial.println(F("[SCAN] >>> Sweeping right..."));
+        } else {
+            Serial.println(F("[SCAN] <<< Sweeping left..."));
+        }
+    }
+
+    // Reverse direction at end of sweep, adjust pitch for raster scan
+    if (scanStepCount >= SCAN_STEPS_PER_SWEEP) {
+        scanStepCount = 0;
+        scanRight = !scanRight;
+
+        // Cycle pitch through 3 levels: low, mid, high
+        scanPitchLevel = (scanPitchLevel + 1) % 3;
+        int pitchAngles[] = {85, 100, 115};
+        pitchServoVal = pitchAngles[scanPitchLevel];
+        pitchServo.write(pitchServoVal);
+
+        Serial.print(F("[SCAN] --- Reversing. Pitch level "));
+        Serial.println(scanPitchLevel);
+    }
+}
+
 // ── Serial command parser ─────────────────────────────────────────────────────
-// camSerial (D4) : X<signed_int>Y<signed_int>\n  from ESP32-CAM e.g. "X-45Y23\n"
-// Serial    (D0) : single letter + \n            from USB        e.g. "L\n"
-//                  L/R = yaw, U/D = pitch, F = fire, H = home, Y/N = gestures
 void handleSerialCommands() {
 
-    // ── Camera stream (SoftwareSerial D4) — X/Y tracking data ────────────────
+    // ── Camera stream (SoftwareSerial D4) ────────────────────────────────────
     {
         static char    camBuf[32];
         static uint8_t camPos     = 0;
@@ -269,35 +376,87 @@ void handleSerialCommands() {
                 camBuf[camPos] = '\0';
                 camPos = 0;
 
-                if ((currentMode == TRACKING || currentMode == AUTOFIRE) && camBuf[0] == 'X') {
-                    int ex = atoi(camBuf + 1);
-                    char* p = camBuf + 1;
-                    while (*p && *p != 'Y') p++;
-                    if (*p == 'Y') {
-                        int ey = atoi(p + 1);
+                if (currentMode == TRACKING || currentMode == AUTOFIRE) {
+
+                    // ── Scan command ─────────────────────────────────────
+                    if (camBuf[0] == 'S') {
+                        if (wasTracking) {
+                            Serial.println(F("[TRACK] Target lost."));
+                            Serial.println(F("[SCAN] Resuming patrol...\n"));
+                            wasTracking = false;
+                            dwellCount  = 0;
+                            rollServo.write(rollStopSpeed); // stop firing
+                        }
+                        doScanStep();
                         lastTrackMs = millis();
+                    }
 
-                        // Yaw: error_x > 0 = target right = clockwise = stop - offset
-                        int yawOffset = constrain(ex / YAW_DIV, -90, 90);
-                        yawServo.write(yawStopSpeed - yawOffset);
+                    // ── Tracking command ─────────────────────────────────
+                    else if (camBuf[0] == 'X') {
+                        int ex = atoi(camBuf + 1);
+                        char* p = camBuf + 1;
+                        while (*p && *p != 'Y') p++;
+                        if (*p == 'Y') {
+                            int ey = atoi(p + 1);
+                            lastTrackMs = millis();
 
-                        // Pitch: error_y > 0 = target below centre = decrease angle
-                        int pitchDelta = ey / PITCH_DIV;
-                        pitchServoVal = constrain(pitchServoVal - pitchDelta, pitchMin, pitchMax);
-                        pitchServo.write(pitchServoVal);
+                            // First detection after scanning
+                            if (!wasTracking && (ex != 0 || ey != 0)) {
+                                wasTracking = true;
+                                Serial.println(F(""));
+                                Serial.println(F("[ALERT] *** MOTION DETECTED ***"));
+                            }
 
-                        // ── Auto-fire logic ───────────────────────────────
-                        if (currentMode == AUTOFIRE) {
-                            bool onTarget = (ex > -AUTOFIRE_AIM_THRESHOLD && ex < AUTOFIRE_AIM_THRESHOLD)
-                                         && (ey > -AUTOFIRE_AIM_THRESHOLD && ey < AUTOFIRE_AIM_THRESHOLD);
-                            if (onTarget) {
-                                dwellCount++;
-                                if (dwellCount >= AUTOFIRE_DWELL_FRAMES) {
-                                    rollServo.write(rollStopSpeed + rollMoveSpeed);
+                            // Step-based tracking
+                            int xSteps = constrain(abs(ex) / 25, 0, 3);
+                            int ySteps = constrain(abs(ey) / 25, 0, 3);
+
+                            if (ex > 0)      rightMove(xSteps);
+                            else if (ex < 0) leftMove(xSteps);
+
+                            if (ey > 0)      downMove(ySteps);
+                            else if (ey < 0) upMove(ySteps);
+
+                            // Tracking serial output
+                            if (ex != 0 || ey != 0) {
+                                bool locked = (abs(ex) < AUTOFIRE_AIM_THRESHOLD)
+                                           && (abs(ey) < AUTOFIRE_AIM_THRESHOLD);
+                                if (locked) {
+                                    Serial.println(F("[TRACK] ** LOCKED ON **"));
+                                } else {
+                                    Serial.print(F("[TRACK] Target X:"));
+                                    Serial.print(ex);
+                                    Serial.print(F(" Y:"));
+                                    Serial.print(ey);
+                                    if (abs(ex) > 50 || abs(ey) > 50) {
+                                        Serial.println(F(" | Intercepting..."));
+                                    } else {
+                                        Serial.println(F(" | Closing in..."));
+                                    }
                                 }
-                            } else {
-                                dwellCount = 0;
-                                rollServo.write(rollStopSpeed);
+                            }
+
+                            // ── Auto-fire logic ──────────────────────────
+                            if (currentMode == AUTOFIRE) {
+                                bool onTarget = (abs(ex) < AUTOFIRE_AIM_THRESHOLD)
+                                             && (abs(ey) < AUTOFIRE_AIM_THRESHOLD);
+                                if (onTarget) {
+                                    dwellCount++;
+                                    if (dwellCount == AUTOFIRE_DWELL_FRAMES) {
+                                        Serial.println(F("[FIRE] >>> ENGAGING TARGET <<<"));
+                                        engageCount++;
+                                    }
+                                    if (dwellCount >= AUTOFIRE_DWELL_FRAMES) {
+                                        rollServo.write(rollStopSpeed + rollMoveSpeed);
+                                    }
+                                } else {
+                                    if (dwellCount >= AUTOFIRE_DWELL_FRAMES) {
+                                        rollServo.write(rollStopSpeed);
+                                        Serial.print(F("[FIRE] Cease fire. Engagements: "));
+                                        Serial.println(engageCount);
+                                    }
+                                    dwellCount = 0;
+                                }
                             }
                         }
                     }
